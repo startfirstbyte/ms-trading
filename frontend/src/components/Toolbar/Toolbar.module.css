@@ -1,0 +1,118 @@
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 16px;
+  height: 44px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.group {
+  display: flex;
+  gap: 4px;
+}
+
+.separator {
+  width: 1px;
+  height: 22px;
+  background: var(--border);
+  flex-shrink: 0;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.btn {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--muted);
+  padding: 5px 13px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  transition: color 0.12s, border-color 0.12s, background 0.12s;
+  white-space: nowrap;
+}
+
+.btn:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--border);
+  background: var(--hover);
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn.active {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.symbolBtn {
+  font-weight: 600;
+}
+
+.symbolSelect {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 5px 28px 5px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  outline: none;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23787b86'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  transition: border-color 0.12s;
+}
+.symbolSelect:hover { border-color: var(--accent); }
+.symbolSelect:focus { border-color: var(--accent); }
+.symbolSelect option { background: #161b22; }
+
+.recalcBtn {
+  color: var(--green);
+  border-color: transparent;
+  font-size: 12px;
+  padding: 5px 10px;
+  letter-spacing: 0.03em;
+}
+
+.recalcBtn:hover:not(:disabled) {
+  color: #fff;
+  background: var(--green);
+  border-color: var(--green);
+}
+
+.recalcBtn:active:not(:disabled) {
+  opacity: 0.75;
+  transform: scale(0.96);
+}
+
+.msChip {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 3px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  letter-spacing: 0.02em;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.msChipUp   { color: var(--green); border-color: var(--green); }
+.msChipDown { color: var(--red);   border-color: var(--red);   }

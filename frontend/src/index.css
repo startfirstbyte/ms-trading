@@ -1,0 +1,51 @@
+*, *::before, *::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/* ── Project theme vars (chart + existing components) ── */
+:root {
+  --bg:      #131722;
+  --surface: #1e222d;
+  --border:  #2a2e39;
+  --text:    #d1d4dc;
+  --muted:   #787b86;
+  --accent:  #2962ff;
+  --green:   #26a69a;
+  --red:     #ef5350;
+  --hover:   #2a2e39;
+}
+
+html, body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Trebuchet MS', sans-serif;
+  font-size: 13px;
+  overflow: hidden;
+}
+
+#root { height: 100%; }
+
+.app {
+  display: flex;
+  flex-direction: row;     /* left column (toolbar + chart) | right column (AI Signal) */
+  height: 100vh;
+}
+
+/* Left column: toolbar stacked above the chart */
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* kept for any legacy use */
+.content {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}

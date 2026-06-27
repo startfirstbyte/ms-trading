@@ -1,0 +1,75 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: mt5_redis
+    ports:
+      - "6379:6379"
+    command: redis-server --save "" --appendonly no --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: mt5_postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB:       trading
+      POSTGRES_USER:     trader
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - mt5_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trader -d trading"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: mt5_server
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379
+      # AI qua Claude CLI Bridge trên host (subscription) thay vì Anthropic API.
+      # Đổi sang "api" để quay lại gọi API trực tiếp.
+      AI_BACKEND: ${AI_BACKEND:-api}
+      LOCAL_CLAUDE_URL: ${LOCAL_CLAUDE_URL:-http://host.containers.internal:8088}
+      AI_LOCAL_MODEL: ${AI_LOCAL_MODEL:-sonnet}
+    extra_hosts:
+      # Cho container Podman/Docker truy cập bridge chạy trên host.
+      - "host.containers.internal:host-gateway"
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: mt5_frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app/frontend
+      - /app/frontend/node_modules   # giữ node_modules của container, không bị override
+      - ./package:/app/package
+    depends_on:
+      - server
+    restart: unless-stopped
+
+volumes:
+  mt5_pgdata:
