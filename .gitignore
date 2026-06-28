@@ -28,6 +28,14 @@ dist/
 ai_analyst.log
 ai_analyst_err.log
 
+# ───── Vendored / 3rd-party build artifacts ─────
+# TradingView Charting Library (proprietary, minified bundles — not source)
+package/
+
+# ───── Runtime / process files ─────
+.pids
+*.pid
+
 # ───── Local data / DB volumes ─────
 data/
 
