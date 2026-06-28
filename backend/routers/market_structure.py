@@ -10,7 +10,9 @@ from backend.core import config, state
 from backend.db.postgres import (
     _get_editing_channel, _insert_editing_channel,
     _update_editing_channel, _commit_channel, _get_channels,
-    _get_last_break_time, _prune_committed_channels,
+    _prune_committed_channels,
+    _get_confirmed_channel, _promote_to_confirmed,
+    _update_confirmed_channel, _delete_channel,
 )
 
 router = APIRouter()
@@ -32,6 +34,23 @@ _CH_TOUCH_MIN = 2
 # Số committed giữ lại mỗi (symbol, resolution) — phần cũ hơn bị prune sau mỗi commit,
 # và cũng là số committed tối đa hiển thị trên chart.
 _KEEP_COMMITTED = 3
+
+# editing → confirmed khi có ≥ N pivot chạm rail (đủ xác nhận xu hướng).
+# _NEST_SIMILAR_BARS: editing mới coi như "trùng" confirmed (cùng leg) nếu time_start lệch
+# ≤ N bar và cùng direction → KHÔNG tạo editing (tránh vẽ đè macro). PROVISIONAL — re-tune sau.
+_PROMOTE_TOUCH      = 4
+_NEST_SIMILAR_BARS  = 4
+
+
+def _channels_similar(d: dict | None, c: dict | None, resolution: str) -> bool:
+    """editing mới `d` có cùng leg với confirmed `c`? (cùng direction + time_start sát nhau).
+    Dùng để khỏi tạo editing đè lên confirmed (chỉ nest khi `d` là sub-leg mới hơn rõ rệt)."""
+    if not d or not c:
+        return False
+    if d.get("direction") != c.get("direction"):
+        return False
+    gap_ms = _NEST_SIMILAR_BARS * _RES_MS.get(resolution, 60_000)
+    return abs(int(d.get("time_start", 0)) - int(c.get("time_start", 0))) <= gap_ms
 
 
 def _channel_ok(ch: dict | None) -> bool:
@@ -55,28 +74,30 @@ def _project_line(start_val: float, end_val: float,
     return end_val + slope * (t_at - t_end)
 
 
-def _clamp_channel_left(ch: dict, floor_ms: int) -> dict:
-    """
-    Cắt mép TRÁI của channel về floor_ms (= điểm phá biên của committed trước) để
-    leg editing không chồng lên committed. Giữ nguyên slope/width (đo ở mép phải),
-    chỉ dời time_start + chiếu lại upper_start/lower_start tới floor_ms.
-    """
-    if not ch or not floor_ms:
-        return ch
-    t_start = int(ch.get("time_start", 0))
-    t_end   = int(ch.get("time_end", 0))
-    if floor_ms <= t_start or floor_ms >= t_end:
-        return ch   # không cần cắt, hoặc leg quá ngắn → để nguyên
-    out = dict(ch)
-    for edge in ("upper", "lower"):
-        s = ch.get(f"{edge}_start")
-        e = ch.get(f"{edge}_end")
-        if s is None or e is None:
-            continue
-        slope = (e - s) / (t_end - t_start)
-        out[f"{edge}_start"] = round(s + slope * (floor_ms - t_start), 5)
-    out["time_start"] = int(floor_ms)
-    return out
+def _break_side(prev: dict, close: float, close_time: int,
+                buffer: float) -> str | None:
+    """Giá đóng `close` có phá rail của channel `prev` (chiếu tới close_time) + buffer?
+    Trả 'upper' | 'lower' | None."""
+    t_start = int(prev.get("time_start", 0))
+    t_end   = int(prev.get("time_end", close_time))
+    upper_at = _project_line(prev.get("upper_start", prev.get("upper", 0.0)),
+                             prev.get("upper_end",   prev.get("upper", 0.0)),
+                             t_start, t_end, close_time)
+    lower_at = _project_line(prev.get("lower_start", prev.get("lower", 0.0)),
+                             prev.get("lower_end",   prev.get("lower", 0.0)),
+                             t_start, t_end, close_time)
+    if close > upper_at + buffer:
+        return "upper"
+    if close < lower_at - buffer:
+        return "lower"
+    return None
+
+
+def _break_buffer(ch: dict, new_atr: float) -> float:
+    """Buffer phá biên theo ATR (sàn theo width) cho channel `ch`."""
+    width = ch.get("width") or (ch.get("upper_end", 0.0) - ch.get("lower_end", 0.0))
+    atr   = new_atr or ch.get("atr", 0.0) or 0.0
+    return max(_BREAK_ATR_MULT * atr, _BREAK_MIN_WIDTH_FRAC * width) if (atr or width) else 0.0
 
 
 def _project_channel_right(ch: dict, ceil_ms: int) -> dict:
@@ -121,78 +142,75 @@ async def _update_channel_lifecycle(symbol: str, resolution: str,
                                     close: float, close_time: int,
                                     last_pivot_time: int = 0) -> None:
     """
-    Đẩy channel mới tính (`channel`) qua máy trạng thái editing/committed.
+    Máy trạng thái 3 bậc: editing → confirmed → committed. editing & confirmed sống
+    SONG SONG (nesting: trend nhỏ trong trend lớn).
 
-    - Gate B: chỉ persist channel đủ tốt (`_channel_ok`) — channel mới noise sẽ KHÔNG
-      ghi đè kênh đang sống; break vẫn được phát hiện trên `prev`.
-    - Break: chiếu biên `prev` tới `close_time`, vượt biên + buffer (theo ATR) → commit.
-    - Không break (freeze-until-pivot, mục C): có pivot xác nhận MỚI → re-fit anchor+slope;
-      chưa có pivot mới → chỉ ĐẨY mép phải `prev` tới hiện tại, giữ nguyên slope/width.
+    A. CONFIRMED (macro, khoá slope): phá rail → committed; không phá → kéo dài mép phải.
+    B. EDITING (micro, tự do): phá rail → XOÁ (làm lại, không lưu); không phá → freeze-until-pivot.
+       Tạo editing mới nếu trống & channel tốt & không trùng confirmed (tránh đè macro).
+    C. PROMOTE: editing đủ pivot (touch ≥ _PROMOTE_TOUCH) & chưa có confirmed → lên confirmed.
     """
     if not state.pg_pool or not channel:
         return
 
-    ok_new = _channel_ok(channel)   # channel vừa tính có đủ tốt để persist không?
+    ok_new = _channel_ok(channel)
+    new_atr = channel.get("atr", 0.0) or 0.0
+    touch   = int(channel.get("touch", 0))
 
-    # Mốc bắt đầu leg hiện tại = điểm phá biên của committed gần nhất (nếu có).
-    floor_ms = await _get_last_break_time(symbol, resolution)
+    conf = await _get_confirmed_channel(symbol, resolution)
+    edit = await _get_editing_channel(symbol, resolution)
 
-    cur = await _get_editing_channel(symbol, resolution)
-    if cur is None:
-        if ok_new:
-            channel["last_pivot_time"] = int(last_pivot_time)
-            await _insert_editing_channel(symbol, resolution,
-                                          _clamp_channel_left(channel, floor_ms))
-        return
+    conf_geom: dict | None = None   # geometry của confirmed còn sống cuối lượt (cho similarity)
+    has_conf = False                # còn confirmed sống không (để chặn promote/tạo editing trùng)
 
-    prev = cur["channel"]
-    t_start = int(prev.get("time_start", 0))
-    t_end   = int(prev.get("time_end", close_time))
-    width   = prev.get("width") or (prev.get("upper_end", 0.0) - prev.get("lower_end", 0.0))
-    atr     = channel.get("atr", 0.0) or prev.get("atr", 0.0) or 0.0
-    buffer  = max(_BREAK_ATR_MULT * atr, _BREAK_MIN_WIDTH_FRAC * width) if (atr or width) else 0.0
-
-    upper_at = _project_line(prev.get("upper_start", prev.get("upper", 0.0)),
-                             prev.get("upper_end",   prev.get("upper", 0.0)),
-                             t_start, t_end, close_time)
-    lower_at = _project_line(prev.get("lower_start", prev.get("lower", 0.0)),
-                             prev.get("lower_end",   prev.get("lower", 0.0)),
-                             t_start, t_end, close_time)
-
-    break_side: str | None = None
-    if close > upper_at + buffer:
-        break_side = "upper"
-    elif close < lower_at - buffer:
-        break_side = "lower"
-
-    if break_side:
-        # Cắt mép phải committed về điểm phá biên (kết thúc đúng tại breakout).
-        await _update_editing_channel(cur["id"], _project_channel_right(prev, close_time))
-        await _commit_channel(cur["id"], break_side, close, close_time)
-        # Leg mới bắt đầu TỪ điểm phá biên → không chồng lên committed vừa đóng.
-        # Chỉ mở leg editing mới nếu channel mới đủ tốt; nếu không, để trống tới khi
-        # có channel tốt (lần compute sau cur=None → insert).
-        if ok_new:
-            channel["last_pivot_time"] = int(last_pivot_time)
-            await _insert_editing_channel(symbol, resolution,
-                                          _clamp_channel_left(channel, close_time))
-        pruned = await _prune_committed_channels(symbol, resolution, _KEEP_COMMITTED)
-        log.info(f"Channel COMMIT {symbol}:{resolution} id={cur['id']} "
-                 f"side={break_side} @ {close} (buffer={buffer:.5f} atr={atr:.5f}) "
-                 f"→ {'new editing leg' if ok_new else 'no editing (low quality)'} "
-                 f"(pruned {pruned} old committed)")
-    else:
-        # Freeze-until-pivot: re-fit chỉ khi có pivot mới VÀ channel mới đủ tốt;
-        # ngược lại giữ slope/width của prev, chỉ đẩy mép phải tới hiện tại.
-        prev_lpt = int(prev.get("last_pivot_time", 0))
-        if ok_new and int(last_pivot_time) > prev_lpt:
-            channel["last_pivot_time"] = int(last_pivot_time)
-            await _update_editing_channel(cur["id"],
-                                          _clamp_channel_left(channel, floor_ms))
+    # ── A. CONFIRMED: commit khi phá, ngược lại kéo dài ─────────────────────────
+    if conf is not None:
+        cprev = conf["channel"]
+        cbuf  = _break_buffer(cprev, new_atr)
+        bside = _break_side(cprev, close, close_time, cbuf)
+        if bside:
+            await _update_confirmed_channel(conf["id"], _project_channel_right(cprev, close_time))
+            await _commit_channel(conf["id"], bside, close, close_time)
+            pruned = await _prune_committed_channels(symbol, resolution, _KEEP_COMMITTED)
+            log.info(f"Channel COMMIT {symbol}:{resolution} id={conf['id']} confirmed "
+                     f"side={bside} @ {close} (buf={cbuf:.5f}) pruned={pruned}")
         else:
-            extended = _project_channel_right(prev, close_time)
-            extended["last_pivot_time"] = prev_lpt   # giữ mốc pivot cũ
-            await _update_editing_channel(cur["id"], extended)
+            extended = _project_channel_right(cprev, close_time)
+            extended["last_pivot_time"] = int(cprev.get("last_pivot_time", 0))
+            await _update_confirmed_channel(conf["id"], extended)
+            conf_geom, has_conf = extended, True
+
+    # ── B. EDITING: phá → xoá; ngược lại freeze-until-pivot ─────────────────────
+    if edit is not None:
+        eprev = edit["channel"]
+        ebuf  = _break_buffer(eprev, new_atr)
+        if _break_side(eprev, close, close_time, ebuf):
+            await _delete_channel(edit["id"])
+            log.info(f"Channel DISCARD {symbol}:{resolution} id={edit['id']} editing (broke immature)")
+            edit = None
+        else:
+            prev_lpt = int(eprev.get("last_pivot_time", 0))
+            if ok_new and int(last_pivot_time) > prev_lpt:
+                channel["last_pivot_time"] = int(last_pivot_time)
+                await _update_editing_channel(edit["id"], channel)        # re-fit tự do (không clamp)
+            else:
+                extended = _project_channel_right(eprev, close_time)
+                extended["last_pivot_time"] = prev_lpt
+                await _update_editing_channel(edit["id"], extended)
+
+    # ── C. PROMOTE editing → confirmed (đủ pivot, chưa có confirmed) ────────────
+    if edit is not None and not has_conf and ok_new and touch >= _PROMOTE_TOUCH:
+        await _promote_to_confirmed(edit["id"])
+        log.info(f"Channel PROMOTE {symbol}:{resolution} id={edit['id']} editing→confirmed "
+                 f"(touch={touch})")
+        edit = None
+        # confirmed vừa lên có geometry ≈ channel hiện tại → dùng để chặn tạo editing trùng.
+        conf_geom, has_conf = channel, True
+
+    # ── Tạo editing mới nếu trống & tốt & không trùng confirmed (nesting) ───────
+    if edit is None and ok_new and not _channels_similar(channel, conf_geom, resolution):
+        channel["last_pivot_time"] = int(last_pivot_time)
+        await _insert_editing_channel(symbol, resolution, channel)        # KHÔNG clamp → cho overlap
 
 
 async def _save_ms_snapshots(symbol: str, resolution: str, result: dict,
