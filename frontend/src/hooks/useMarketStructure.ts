@@ -94,7 +94,10 @@ function drawSnapshot(
 ): Promise<EntityId | null>[] {
   const ids: Promise<EntityId | null>[] = []
   const { waves = [], draw_waves, channel: ch, structure } = snap
-  if (!ch && waves.length < 2) return ids
+  // Vẽ nếu có channel HOẶC đủ pivot để vẽ zigzag (draw_waves ưu tiên, fallback waves).
+  // Trước đây chỉ xét waves → TF pattern=none/channel=null (vd 1m) bị bỏ vẽ dù có draw_waves.
+  const hasZz = (draw_waves?.length ?? 0) >= 2 || waves.length >= 2
+  if (!ch && !hasZz) return ids
 
   const toSec = (ms: number) => Math.floor(ms / 1000)
 
@@ -160,14 +163,17 @@ function drawChannels(
     const ch = pc.channel
     if (!ch || !ch.time_start || !ch.time_end) continue
 
+    // 3 trạng thái: confirmed (đậm nhất) > editing (vừa) > committed (mờ nét đứt).
     const editing      = pc.status === 'editing'
+    const confirmed    = pc.status === 'confirmed'
+    const committed    = pc.status === 'committed'
     const chColor      = ch.direction === 'up' ? '#26a69a' : ch.direction === 'down' ? '#ef5350' : '#787b86'
-    const lw           = editing ? 2 : 1
-    const lstyle       = editing ? 0 : 2     // editing nét liền, committed nét đứt
-    // committed = lịch sử (kênh đã phá): làm MỜ HẲN để lùi về nền, không lấn editing.
-    // Kênh tăng bị phá xuống nằm "trên trời" so với giá hiện tại → phải nhạt để không gây nhiễu.
-    const transparency = editing ? 80 : 97   // committed gần như trong suốt
-    const fillBg       = editing             // committed bỏ fill, chỉ còn viền mảnh nét đứt
+    const lw           = committed ? 1 : 2          // committed mảnh, editing/confirmed đậm
+    const lstyle       = committed ? 2 : 0          // committed nét đứt, còn lại nét liền
+    // fill: confirmed đậm nhất (macro xác nhận) → editing vừa → committed gần như trong suốt.
+    const transparency = confirmed ? 72 : editing ? 82 : 97
+    const fillBg       = !committed                 // committed bỏ fill, chỉ viền mảnh nét đứt
+    const showMid      = !committed
 
     if (ch.channel_type === 'range') {
       ids.push(addShape(chart, [
@@ -190,7 +196,7 @@ function drawChannels(
         linecolor:       chColor,
         linewidth:       lw,
         linestyle:       lstyle,
-        showMidline:     editing,
+        showMidline:     showMid,
         midlinecolor:    chColor,
         midlinestyle:    1,
         midlinewidth:    1,
@@ -202,8 +208,8 @@ function drawChannels(
       }))
     }
 
-    // Nhãn đo lường — chỉ cho channel đang editing
-    if (editing) {
+    // Nhãn đo lường — editing & confirmed (confirmed có dấu ✓ phân biệt xu hướng đã xác nhận)
+    if (editing || confirmed) {
       const width   = ch.width ?? (ch.upper - ch.lower)
       const pctText = ch.width_pct != null
         ? ch.width_pct.toFixed(2)
@@ -211,10 +217,11 @@ function drawChannels(
       const ampText = width >= 50 ? width.toFixed(1) : width.toFixed(2)
       const posPct  = Math.round((ch.pos ?? 0.5) * 100)
       const edge    = ch.upper_end ?? ch.upper
+      const prefix  = confirmed ? '✓ ' : ''
       ids.push(addShape(chart,
         { time: toSec(ch.time_end), price: edge },
         'text', {
-          text:      `Biên độ ${ampText} (${pctText}%)  ·  Vị trí ${posPct}%`,
+          text:      `${prefix}Biên độ ${ampText} (${pctText}%)  ·  Vị trí ${posPct}%`,
           color:     chColor,
           fontsize:  11,
           bold:      true,
@@ -223,7 +230,7 @@ function drawChannels(
     }
 
     // Committed — đánh dấu điểm phá biên (text trung tính, không dùng mũi tên)
-    if (!editing && pc.break_price != null && pc.break_time != null) {
+    if (committed && pc.break_price != null && pc.break_time != null) {
       ids.push(addShape(chart,
         { time: toSec(pc.break_time), price: pc.break_price },
         'text', {
@@ -286,6 +293,10 @@ export function useMarketStructure(
     const n    = snapshots.length
     const ids: Promise<EntityId | null>[] = []
 
+    // Channels vẽ TRƯỚC (nền có fill) → zigzag/label vẽ SAU sẽ nằm TRÊN, không bị fill
+    // của confirmed/editing che. (z-order TradingView: shape vẽ sau nằm trên.)
+    ids.push(...drawChannels(chart, channels))
+
     for (let i = 0; i < n; i++) {
       const snap     = snapshots[i]
       const isLatest = i === 0
@@ -313,9 +324,6 @@ export function useMarketStructure(
         { time: Math.floor(b.time / 1000), price: b.price },
       ], 'trend_line', { linecolor: segColor, linewidth: 1, linestyle: 0 }))
     }
-
-    // Channels (editing + committed) từ store có lifecycle
-    ids.push(...drawChannels(chart, channels))
 
     shapeIdsRef.current = ids
     if (snapshots.length) setChip(buildChip(snapshots[0]))

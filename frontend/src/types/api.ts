@@ -54,7 +54,7 @@ export interface MSChannel {
 // Channel có vòng đời, lưu DB (/api/channels)
 export interface PriceChannel {
   id: number
-  status: 'editing' | 'committed'
+  status: 'editing' | 'confirmed' | 'committed'
   channel: MSChannel | null
   break_side: 'upper' | 'lower' | null
   break_price: number | null
