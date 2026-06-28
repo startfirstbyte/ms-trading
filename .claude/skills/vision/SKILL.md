@@ -80,6 +80,37 @@ python worker.py
 ./start.ps1 -Background   # headless; stop with: Get-Content .pids | Stop-Process
 ```
 
+### Full cold start — "start the analyze system" (nothing running yet)
+
+Two independent halves: **containers** (compose) + **host processes** (start.ps1). They are
+separate — `start.ps1` does NOT start the containers, it only starts bridge + worker on the
+host and syncs the bridge IP. Run in this order (containers first, so start.ps1's IP-sync can
+recreate `server` if the WSL gateway IP changed):
+
+```bash
+# 1. Containers: redis, postgres, server, frontend (redis/pg healthchecks gate server/frontend)
+podman compose up -d
+
+# 2. Host: Claude bridge (:8088) + MT5 worker, headless; also syncs WSL gateway IP → .env
+./start.ps1 -Background
+```
+
+Then verify all paths (both realtime + history are independent — check both):
+
+```bash
+podman ps --format "{{.Names}}\t{{.Status}}"                       # 4 up; redis+pg healthy
+Invoke-RestMethod http://127.0.0.1:8088/health                     # bridge ok:true
+Invoke-RestMethod http://localhost:8000/api/symbols                # server up
+(Invoke-WebRequest http://localhost:5173 -UseBasicParsing).StatusCode  # frontend 200
+podman exec mt5_redis redis-cli ZCARD mt5:bars:BTCUSD:60           # history path > 0
+podman exec mt5_redis redis-cli PUBSUB NUMSUB mt5:tick:BTCUSD      # realtime path ≥ 1
+Get-Content worker.err.log -Tail 3                                  # "Backfill complete" + poll loop
+```
+
+> Worker logs go to `worker.out.log` / `worker.err.log`; bridge to `bridge.log` / `bridge.err.log`.
+> Stop everything: `Get-Content .pids | Stop-Process` (host) + `podman compose down` (containers).
+> PowerShell gotcha: `"mt5:bars:$s:60"` mis-parses `$s:` as a scope — use `"mt5:bars:${s}:60"`.
+
 ---
 
 ## Reference: File Map

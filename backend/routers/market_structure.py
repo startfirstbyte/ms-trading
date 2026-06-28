@@ -18,12 +18,32 @@ log = logging.getLogger(__name__)
 
 _RES_MS = {'1': 60_000, '3': 180_000, '5': 300_000, '15': 900_000, '60': 3_600_000}
 
-# Buffer khi xét phá biên = phần trăm width của channel persisted.
-_CHANNEL_BREAK_BUFFER = 0.10
+# Buffer khi xét phá biên: theo ATR (biến động) thay vì % width cố định (width hay bị
+# 1 wick thổi phồng). Có sàn theo width khi atr=0/thiếu.
+# PROVISIONAL pre-A — RE-TUNE sau khi A đổi cách tính width/biên.
+_BREAK_ATR_MULT       = 0.5
+_BREAK_MIN_WIDTH_FRAC = 0.05
+
+# Cổng chất lượng: chỉ persist channel đủ tốt (chặn noise lên chart).
+# PROVISIONAL pre-A — RE-TUNE sau khi A đổi metric quality.
+_CH_Q_MIN     = 0.40
+_CH_TOUCH_MIN = 2
 
 # Số committed giữ lại mỗi (symbol, resolution) — phần cũ hơn bị prune sau mỗi commit,
 # và cũng là số committed tối đa hiển thị trên chart.
 _KEEP_COMMITTED = 3
+
+
+def _channel_ok(ch: dict | None) -> bool:
+    """Channel đủ tốt để persist? Range chỉ xét quality; channel xét quality + số touch."""
+    if not ch:
+        return False
+    t = ch.get("channel_type")
+    if t == "range":
+        return ch.get("quality", 0.0) >= _CH_Q_MIN
+    if t == "channel":
+        return ch.get("quality", 0.0) >= _CH_Q_MIN and ch.get("touch", 0) >= _CH_TOUCH_MIN
+    return False
 
 
 def _project_line(start_val: float, end_val: float,
@@ -59,17 +79,21 @@ def _clamp_channel_left(ch: dict, floor_ms: int) -> dict:
     return out
 
 
-def _clamp_channel_right(ch: dict, ceil_ms: int) -> dict:
+def _project_channel_right(ch: dict, ceil_ms: int) -> dict:
     """
-    Cắt mép PHẢI của channel về ceil_ms (= điểm phá biên) khi commit, để committed
-    kết thúc đúng tại breakout, nối liền leg editing kế tiếp. Chiếu lại upper/lower_end
-    và tính lại width/mid/width_pct theo mép phải mới.
+    Chiếu mép PHẢI của channel tới ceil_ms (= điểm phá biên) khi commit, để committed
+    kết thúc đúng tại breakout, nối liền leg editing kế tiếp. Vừa CO (ceil_ms < time_end)
+    vừa NỚI (ceil_ms > time_end) — breakout phát hiện bằng biên chiếu nên thường nằm
+    PHẢI time_end, phải nới thì thân kênh mới chạm tới nhãn 'phá biên'. Chiếu lại
+    upper/lower_end và tính lại width/mid/width_pct theo mép phải mới.
     """
     if not ch or not ceil_ms:
         return ch
     t_start = int(ch.get("time_start", 0))
     t_end   = int(ch.get("time_end", 0))
-    if ceil_ms >= t_end or ceil_ms <= t_start:
+    # Chỉ bỏ qua trường hợp degenerate: breakout tại/trước điểm bắt đầu, hoặc kênh
+    # không có bề rộng thời gian (tránh chia 0 ở slope). Còn lại đều chiếu được.
+    if ceil_ms <= t_start or t_end <= t_start:
         return ch
     out = dict(ch)
     for edge in ("upper", "lower"):
@@ -94,34 +118,39 @@ def _clamp_channel_right(ch: dict, ceil_ms: int) -> dict:
 
 async def _update_channel_lifecycle(symbol: str, resolution: str,
                                     channel: dict | None,
-                                    close: float, close_time: int) -> None:
+                                    close: float, close_time: int,
+                                    last_pivot_time: int = 0) -> None:
     """
     Đẩy channel mới tính (`channel`) qua máy trạng thái editing/committed.
 
-    - Chưa có editing → tạo editing mới.
-    - Có editing: chiếu biên của channel persisted tới `close_time`. Nếu nến ĐÓNG
-      (`close`) vượt biên trên/dưới THÊM buffer (10% width) → commit channel cũ,
-      mở editing mới cho leg kế tiếp. Ngược lại → re-fit (cập nhật editing).
+    - Gate B: chỉ persist channel đủ tốt (`_channel_ok`) — channel mới noise sẽ KHÔNG
+      ghi đè kênh đang sống; break vẫn được phát hiện trên `prev`.
+    - Break: chiếu biên `prev` tới `close_time`, vượt biên + buffer (theo ATR) → commit.
+    - Không break (freeze-until-pivot, mục C): có pivot xác nhận MỚI → re-fit anchor+slope;
+      chưa có pivot mới → chỉ ĐẨY mép phải `prev` tới hiện tại, giữ nguyên slope/width.
     """
     if not state.pg_pool or not channel:
         return
-    if channel.get("channel_type") not in ("channel", "range"):
-        return
+
+    ok_new = _channel_ok(channel)   # channel vừa tính có đủ tốt để persist không?
 
     # Mốc bắt đầu leg hiện tại = điểm phá biên của committed gần nhất (nếu có).
     floor_ms = await _get_last_break_time(symbol, resolution)
 
     cur = await _get_editing_channel(symbol, resolution)
     if cur is None:
-        await _insert_editing_channel(symbol, resolution,
-                                      _clamp_channel_left(channel, floor_ms))
+        if ok_new:
+            channel["last_pivot_time"] = int(last_pivot_time)
+            await _insert_editing_channel(symbol, resolution,
+                                          _clamp_channel_left(channel, floor_ms))
         return
 
     prev = cur["channel"]
     t_start = int(prev.get("time_start", 0))
     t_end   = int(prev.get("time_end", close_time))
     width   = prev.get("width") or (prev.get("upper_end", 0.0) - prev.get("lower_end", 0.0))
-    buffer  = _CHANNEL_BREAK_BUFFER * width if width else 0.0
+    atr     = channel.get("atr", 0.0) or prev.get("atr", 0.0) or 0.0
+    buffer  = max(_BREAK_ATR_MULT * atr, _BREAK_MIN_WIDTH_FRAC * width) if (atr or width) else 0.0
 
     upper_at = _project_line(prev.get("upper_start", prev.get("upper", 0.0)),
                              prev.get("upper_end",   prev.get("upper", 0.0)),
@@ -138,17 +167,32 @@ async def _update_channel_lifecycle(symbol: str, resolution: str,
 
     if break_side:
         # Cắt mép phải committed về điểm phá biên (kết thúc đúng tại breakout).
-        await _update_editing_channel(cur["id"], _clamp_channel_right(prev, close_time))
+        await _update_editing_channel(cur["id"], _project_channel_right(prev, close_time))
         await _commit_channel(cur["id"], break_side, close, close_time)
         # Leg mới bắt đầu TỪ điểm phá biên → không chồng lên committed vừa đóng.
-        await _insert_editing_channel(symbol, resolution,
-                                      _clamp_channel_left(channel, close_time))
+        # Chỉ mở leg editing mới nếu channel mới đủ tốt; nếu không, để trống tới khi
+        # có channel tốt (lần compute sau cur=None → insert).
+        if ok_new:
+            channel["last_pivot_time"] = int(last_pivot_time)
+            await _insert_editing_channel(symbol, resolution,
+                                          _clamp_channel_left(channel, close_time))
         pruned = await _prune_committed_channels(symbol, resolution, _KEEP_COMMITTED)
         log.info(f"Channel COMMIT {symbol}:{resolution} id={cur['id']} "
-                 f"side={break_side} @ {close} → new editing leg (pruned {pruned} old committed)")
+                 f"side={break_side} @ {close} (buffer={buffer:.5f} atr={atr:.5f}) "
+                 f"→ {'new editing leg' if ok_new else 'no editing (low quality)'} "
+                 f"(pruned {pruned} old committed)")
     else:
-        await _update_editing_channel(cur["id"],
-                                      _clamp_channel_left(channel, floor_ms))
+        # Freeze-until-pivot: re-fit chỉ khi có pivot mới VÀ channel mới đủ tốt;
+        # ngược lại giữ slope/width của prev, chỉ đẩy mép phải tới hiện tại.
+        prev_lpt = int(prev.get("last_pivot_time", 0))
+        if ok_new and int(last_pivot_time) > prev_lpt:
+            channel["last_pivot_time"] = int(last_pivot_time)
+            await _update_editing_channel(cur["id"],
+                                          _clamp_channel_left(channel, floor_ms))
+        else:
+            extended = _project_channel_right(prev, close_time)
+            extended["last_pivot_time"] = prev_lpt   # giữ mốc pivot cũ
+            await _update_editing_channel(cur["id"], extended)
 
 
 async def _save_ms_snapshots(symbol: str, resolution: str, result: dict,
@@ -318,9 +362,12 @@ async def compute_ms(
     # Channel lifecycle — xét trên nến ĐÓNG cuối (bỏ live bar nếu vừa append)
     if bar_list:
         commit_bar = bar_list[-2] if (live_appended and len(bar_list) >= 2) else bar_list[-1]
+        # Thời điểm pivot xác nhận gần nhất → freeze-until-pivot (chỉ re-fit khi đổi).
+        last_pivot_time = max((int(w["time"]) for w in result.get("waves", [])), default=0)
         await _update_channel_lifecycle(
             symbol, resolution, result.get("channel"),
             float(commit_bar["close"]), int(commit_bar["time"]),
+            last_pivot_time,
         )
 
     log.info(
