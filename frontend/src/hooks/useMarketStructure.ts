@@ -164,7 +164,10 @@ function drawChannels(
     const chColor      = ch.direction === 'up' ? '#26a69a' : ch.direction === 'down' ? '#ef5350' : '#787b86'
     const lw           = editing ? 2 : 1
     const lstyle       = editing ? 0 : 2     // editing nét liền, committed nét đứt
-    const transparency = editing ? 80 : 93   // committed mờ hơn
+    // committed = lịch sử (kênh đã phá): làm MỜ HẲN để lùi về nền, không lấn editing.
+    // Kênh tăng bị phá xuống nằm "trên trời" so với giá hiện tại → phải nhạt để không gây nhiễu.
+    const transparency = editing ? 80 : 97   // committed gần như trong suốt
+    const fillBg       = editing             // committed bỏ fill, chỉ còn viền mảnh nét đứt
 
     if (ch.channel_type === 'range') {
       ids.push(addShape(chart, [
@@ -174,7 +177,7 @@ function drawChannels(
         color:           chColor,
         linewidth:       lw,
         linestyle:       lstyle,
-        fillBackground:  true,
+        fillBackground:  fillBg,
         backgroundColor: chColor,
         transparency,
       }))
@@ -191,7 +194,7 @@ function drawChannels(
         midlinecolor:    chColor,
         midlinestyle:    1,
         midlinewidth:    1,
-        fillBackground:  true,
+        fillBackground:  fillBg,
         backgroundColor: chColor,
         transparency,
         extendLeft:      false,
