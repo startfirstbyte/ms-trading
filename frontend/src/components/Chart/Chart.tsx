@@ -1,19 +1,17 @@
 import React, { useEffect, useRef } from 'react'
 import type { RefObject } from 'react'
 import type { IChartingLibraryWidget } from 'charting_library'
-import type { AICard, Resolution } from '../../types/api'
+import type { Resolution } from '../../types/api'
 import { createDatafeed } from '../../lib/datafeed'
 import { api } from '../../lib/api'
 import { useMarketStructure } from '../../hooks/useMarketStructure'
 import { useChartState } from '../../hooks/useChartState'
-import { useUserTrade } from '../../hooks/useUserTrade'
 import styles from './Chart.module.css'
 
 interface Props {
   symbol:     string
   resolution: Resolution
   recalcRef?: RefObject<(() => void) | null>
-  aiCards?:   Record<string, AICard>
 }
 
 type TVPoint  = { price?: unknown }
@@ -65,13 +63,10 @@ export function Chart({ symbol, resolution, recalcRef }: Props) {
 
   const { chip: _chip, signal, redraw, clearShapes } = useMarketStructure(widgetRef, chartReadyRef, symbol, resolution)
   const { attach: attachChartState, saveNow }  = useChartState(widgetRef, chartReadyRef, symbol)
-  const { attachUserTrade }                    = useUserTrade(widgetRef, chartReadyRef, symbol, resolution)
   const attachRef     = useRef(attachChartState)
   const saveRef       = useRef(saveNow)
-  const attachTradeRef = useRef(attachUserTrade)
   attachRef.current      = attachChartState
   saveRef.current        = saveNow
-  attachTradeRef.current = attachUserTrade
 
   const redrawRef = useRef(redraw)
   const clearRef  = useRef(clearShapes)
@@ -136,9 +131,16 @@ export function Chart({ symbol, resolution, recalcRef }: Props) {
         try {
           widgetRef.current?.chart().executeActionById('timeScaleReset')
         } catch { /* ignore if action unavailable */ }
+        // EMA overlay bị bỏ (quá nhiều đường EMA trùng nhau) — dọn luôn các study
+        // EMA cũ đã lỡ lưu trong saved_data để không còn tồn đọng trên chart.
+        try {
+          const chart = widgetRef.current?.chart()
+          for (const s of chart?.getAllStudies() ?? []) {
+            if (s.name === 'Moving Average Exponential') chart!.removeEntity(s.id)
+          }
+        } catch { /* ignore if study unavailable */ }
         redrawRef.current()
         attachRef.current()        // subscribe to auto-save (drawings already restored)
-        attachTradeRef.current()   // watch Long/Short Position → AI trade management
       })
     }
 

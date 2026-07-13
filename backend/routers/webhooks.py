@@ -55,13 +55,6 @@ async def webhook_tick(
     for res, bars in closed_by_res.items():
         asyncio.create_task(_upsert_bars_pg(symbol, res, bars))
 
-    # Mark closed bars → AI monitor loop will pick these up
-    if closed_by_res:
-        pipe2 = r.pipeline()
-        for res in closed_by_res:
-            pipe2.set(f"mt5:candle_closed:{symbol}:{res}", "1", ex=120)
-        await pipe2.execute()
-
     return {"ok": True}
 
 

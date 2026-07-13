@@ -187,38 +187,6 @@ async def _init_pg_schema(pool: "config.asyncpg.Pool") -> None:
     log.info("PostgreSQL schema ready")
 
 
-async def _insert_ai_prediction(data: dict, trigger_event: str = "manual") -> None:
-    """Persist AI analysis result to ai_predictions table (fire-and-forget)."""
-    if not state.pg_pool:
-        return
-    try:
-        async with state.pg_pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO ai_predictions
-                    (symbol, resolution, signal, conviction, trigger, analysis,
-                     entry_zone, target, stop_loss, key_level, watch_buy, watch_sell,
-                     analysis_bid, prediction_updated, update_reason, trade_status,
-                     trade_note, trigger_event, context, win_pct,
-                     target1, target2, target3)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
-            """,
-                data.get("symbol"), data.get("resolution"),
-                data.get("signal"), data.get("conviction"),
-                data.get("trigger"), data.get("analysis"),
-                data.get("entry_zone"), data.get("target"), data.get("stop_loss"),
-                data.get("key_level"), data.get("watch_buy"), data.get("watch_sell"),
-                data.get("analysis_bid"),
-                data.get("prediction_updated"), data.get("update_reason"),
-                data.get("trade_status"), data.get("trade_note"),
-                trigger_event,
-                json.dumps(data.get("context")) if data.get("context") else None,
-                data.get("win_pct"),
-                data.get("target1"), data.get("target2"), data.get("target3"),
-            )
-    except Exception as e:
-        log.warning(f"ai_predictions insert failed: {e}")
-
-
 async def _upsert_bars_pg(symbol: str, resolution: str, bars: list[dict]) -> None:
     if not state.pg_pool or not bars:
         return

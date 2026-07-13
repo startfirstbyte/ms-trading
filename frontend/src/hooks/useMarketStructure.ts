@@ -35,6 +35,14 @@ interface MSSnapshot {
 
 // ── Shape helper ──────────────────────────────────────────────────────────────
 
+function hexToRgba(hex: string, alpha: number): string {
+  const h = hex.replace('#', '')
+  const r = parseInt(h.substring(0, 2), 16)
+  const g = parseInt(h.substring(2, 4), 16)
+  const b = parseInt(h.substring(4, 6), 16)
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`
+}
+
 type ShapePoint = { time: number; price: number }
 
 // TradingView v31 returns Promise<EntityId> — store the promise, resolve on removal
@@ -168,6 +176,9 @@ function drawChannels(
     const confirmed    = pc.status === 'confirmed'
     const committed    = pc.status === 'committed'
     const chColor      = ch.direction === 'up' ? '#26a69a' : ch.direction === 'down' ? '#ef5350' : '#787b86'
+    // committed dùng màu pha loãng alpha — nét mảnh/nét đứt trước đây vẫn giữ màu
+    // gốc 100% nên nhìn không thực sự mờ; giờ viền cũng nhạt đi để rõ là "channel cũ".
+    const lineColor    = committed ? hexToRgba(chColor, 0.35) : chColor
     const lw           = committed ? 1 : 2          // committed mảnh, editing/confirmed đậm
     const lstyle       = committed ? 2 : 0          // committed nét đứt, còn lại nét liền
     // fill: confirmed đậm nhất (macro xác nhận) → editing vừa → committed gần như trong suốt.
@@ -180,7 +191,7 @@ function drawChannels(
         { time: toSec(ch.time_start), price: ch.upper },
         { time: toSec(ch.time_end),   price: ch.lower },
       ], 'rectangle', {
-        color:           chColor,
+        color:           lineColor,
         linewidth:       lw,
         linestyle:       lstyle,
         fillBackground:  fillBg,
@@ -193,7 +204,7 @@ function drawChannels(
         { time: toSec(ch.time_end),   price: ch.lower_end   ?? ch.lower },
         { time: toSec(ch.time_end),   price: ch.upper_end   ?? ch.upper },
       ], 'parallel_channel', {
-        linecolor:       chColor,
+        linecolor:       lineColor,
         linewidth:       lw,
         linestyle:       lstyle,
         showMidline:     showMid,

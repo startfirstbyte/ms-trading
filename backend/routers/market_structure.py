@@ -1,4 +1,5 @@
 """Market Structure endpoints — cached read, compute+snapshot, snapshot replay."""
+import asyncio
 import json
 import logging
 
@@ -274,7 +275,7 @@ async def _save_ms_snapshots(symbol: str, resolution: str, result: dict,
                 )
                 if exists:
                     continue
-                hist_result = ms_detect(hist_bars, resolution)
+                hist_result = await asyncio.to_thread(ms_detect, hist_bars, resolution)
                 hist_result["symbol"]      = symbol
                 hist_result["resolution"]  = resolution
                 hist_result["computed_at"] = computed_at_hist
@@ -288,8 +289,9 @@ _EMPTY_MS = {
     "targets": [], "fib": None, "waves": [], "pivots_count": 0,
 }
 
-# 1m quá nhiễu → kế thừa MS từ 3m (đỉnh/đáy, BOS/CHOCH, channel)
-_MS_DELEGATE = {"1": "3"}
+# Mỗi timeframe tự tính MS/channel độc lập (1m không còn kế thừa 3m).
+# Detector đã có param riêng cho '1' (_TF_ZZ_DEPTH, horizon, lookback…).
+_MS_DELEGATE: dict[str, str] = {}
 
 
 @router.get("/api/ms")
@@ -366,7 +368,9 @@ async def compute_ms(
     # The "current" window is the last `bars` bars
     bar_list = all_bars[-bars:] if len(all_bars) > bars else all_bars
 
-    result = ms_detect(bar_list, resolution)
+    # Chạy trong thread pool riêng — _detect_impl là CPU-bound (zigzag/pandas),
+    # nếu chạy trực tiếp trên event loop sẽ chặn webhook ghi data đến cùng lúc.
+    result = await asyncio.to_thread(ms_detect, bar_list, resolution)
     result["symbol"]     = symbol
     result["resolution"] = resolution
     # Ensure computed_at is always the last bar's time (not 0 or missing)
@@ -401,7 +405,7 @@ async def get_channels(
     symbol:     str = Query(...),
     resolution: str = Query(...),
 ):
-    """Channel editing + tối đa _KEEP_COMMITTED committed mới nhất. 1m kế thừa 3m như MS."""
+    """Channel editing + tối đa _KEEP_COMMITTED committed mới nhất (mỗi TF độc lập)."""
     src = _MS_DELEGATE.get(resolution, resolution)
     return await _get_channels(symbol, src, _KEEP_COMMITTED)
 
@@ -412,8 +416,7 @@ async def get_ms_snapshots(
     resolution: str = Query(...),
     limit:      int = Query(4, ge=1, le=20),
 ):
-    """Return the last `limit` Market Structure snapshots from DB for chart replay.
-    1m kế thừa 3m (như /api/ms, /api/channels) — tránh lấy snapshot '1' cũ/lạc."""
+    """Return the last `limit` Market Structure snapshots from DB for chart replay."""
     resolution = _MS_DELEGATE.get(resolution, resolution)
     if not state.pg_pool:
         return []
