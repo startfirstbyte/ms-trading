@@ -9,9 +9,10 @@ import { useChartState } from '../../hooks/useChartState'
 import styles from './Chart.module.css'
 
 interface Props {
-  symbol:     string
-  resolution: Resolution
-  recalcRef?: RefObject<(() => void) | null>
+  symbol:      string
+  resolution:  Resolution
+  recalcRef?:  RefObject<(() => void) | null>
+  showSrZones?: boolean
 }
 
 type TVPoint  = { price?: unknown }
@@ -55,13 +56,13 @@ const WIDGET_OVERRIDES: Record<string, unknown> = {
   'mainSeriesProperties.showCountdown':               true,
 }
 
-export function Chart({ symbol, resolution, recalcRef }: Props) {
+export function Chart({ symbol, resolution, recalcRef, showSrZones = true }: Props) {
   const containerRef  = useRef<HTMLDivElement>(null)
   const widgetRef     = useRef<IChartingLibraryWidget | null>(null)
   const chartReadyRef = useRef<boolean>(false)
   const datafeedRef   = useRef<ReturnType<typeof createDatafeed> | null>(null)
 
-  const { chip: _chip, signal, redraw, clearShapes } = useMarketStructure(widgetRef, chartReadyRef, symbol, resolution)
+  const { chip: _chip, signal, redraw, clearShapes } = useMarketStructure(widgetRef, chartReadyRef, symbol, resolution, showSrZones)
   const { attach: attachChartState, saveNow }  = useChartState(widgetRef, chartReadyRef, symbol)
   const attachRef     = useRef(attachChartState)
   const saveRef       = useRef(saveNow)

@@ -90,6 +90,19 @@ export interface MSRuleSignal {
   labels: string[]
 }
 
+export interface MSZone {
+  lo:       number
+  hi:       number
+  mid:      number
+  strength: number   // số pivot/biên kênh gom vào vùng — càng cao càng "mạnh"
+  recency:  number   // số bar từ pivot gần nhất trong vùng tới hiện tại
+}
+
+export interface MSSrZones {
+  supports:    MSZone[]   // gần giá hiện tại nhất trước
+  resistances: MSZone[]
+}
+
 export interface MSResult {
   pattern: string
   direction: 'bullish' | 'bearish' | 'neutral'
@@ -105,4 +118,5 @@ export interface MSResult {
   wedge?: MSWedge | null
   structure?: { trend: string; bos_level: number | null; event: string; swings: MSWave[] }
   rule_signal?: MSRuleSignal
+  sr_zones?: MSSrZones
 }
