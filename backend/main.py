@@ -16,9 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.core import config, state
 from backend.db.postgres import _init_pg_schema, _pg_cleanup_loop
 from backend.db.realtime import _pubsub_listener
-from backend.ai.monitor import _ai_monitor_loop
-from backend.ai.outcome_resolver import _outcome_resolver_loop
-from backend.routers import ai, history, market_structure, positions, webhooks, websocket
+from backend.routers import chart_state, history, market_structure, webhooks, websocket
 
 log = logging.getLogger(__name__)
 
@@ -39,15 +37,6 @@ async def lifespan(app: FastAPI):
     else:
         log.warning("DATABASE_URL not set or asyncpg unavailable — bars will not be persisted to PostgreSQL")
 
-    if config.AI_BACKEND == "local":
-        log.info(f"AI backend = LOCAL CLI bridge → {config.LOCAL_CLAUDE_URL} "
-                 f"(model={config.AI_LOCAL_MODEL}, subscription quota)")
-    elif config._ANTHROPIC_AVAILABLE and config.ANTHROPIC_API_KEY:
-        state.ai_client = config._anthropic_lib.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
-        log.info(f"Anthropic client ready — model={config.AI_MODEL}")
-    else:
-        log.warning("ANTHROPIC_API_KEY not set — /api/ai/analyze will return 503")
-
     if not config._MT5:
         log.warning("MT5 not installed — resolve/symbols use static config; history fallback disabled")
     elif not config.mt5.initialize():
@@ -58,21 +47,13 @@ async def lifespan(app: FastAPI):
             config.mt5.login(int(login), password=os.environ["MT5_PASSWORD"], server=os.environ["MT5_SERVER"])
         log.info(f"MT5 ready: {config.mt5.terminal_info().name}")
 
-    # Trần concurrency cho call Claude — tạo trong loop đang chạy (Option 1).
-    state.ai_semaphore = asyncio.Semaphore(config.AI_MAX_CONCURRENCY)
-    log.info(f"AI concurrency limit = {config.AI_MAX_CONCURRENCY} (backend={config.AI_BACKEND})")
-
-    listener    = asyncio.create_task(_pubsub_listener())
-    cleanup     = asyncio.create_task(_pg_cleanup_loop())
-    ai_mon      = asyncio.create_task(_ai_monitor_loop())
-    outcome_res = asyncio.create_task(_outcome_resolver_loop())
+    listener = asyncio.create_task(_pubsub_listener())
+    cleanup  = asyncio.create_task(_pg_cleanup_loop())
 
     yield
 
     listener.cancel()
-    ai_mon.cancel()
     cleanup.cancel()
-    outcome_res.cancel()
     if config._MT5:
         config.mt5.shutdown()
     if state.pg_pool:
@@ -94,7 +75,6 @@ for _router in (
     webhooks.router,
     history.router,
     market_structure.router,
-    ai.router,
-    positions.router,
+    chart_state.router,
 ):
     app.include_router(_router)

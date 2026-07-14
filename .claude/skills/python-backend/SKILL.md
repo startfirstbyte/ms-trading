@@ -193,3 +193,14 @@ ai_monitor); endpoint HTTP + WS + webhook trả đúng như trước; `tsc`/fron
   một ký tự = đổi hành vi model). Xem `technical-analysis` skill để hiểu prompt.
 - **Đổi/so model AI** thuộc địa hạt `technical-analysis` skill (biến `AI_MODEL`).
 - **Background task phải được cancel trong lifespan teardown** để rebuild/reload không leak task.
+
+---
+
+## 6. Long-form docs (Obsidian)
+
+Chi tiết "why" đằng sau các quyết định backend — quá dài cho skill này — sống trong Obsidian
+vault, `Trading Project/`: [[ADR-001-claude-cli-bridge]] (bridge networking Podman↔host),
+[[ADR-002-weekend-history-fallback]] (`/api/history` fallback), [[ADR-003-server-refactor]]
+(lịch sử tách server.py — bối cảnh đầy đủ cho §3/§4 ở trên), [[api-endpoints]],
+[[redis-pg-schema]], [[worker-data-flow]] (chẩn đoán data đứng phía worker/host).
+Query theo `related-skill: python-backend` qua `mcp__obsidian__search_query` nếu cần liệt kê hết.

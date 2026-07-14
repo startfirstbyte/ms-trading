@@ -30,11 +30,11 @@ html, body {
 
 .app {
   display: flex;
-  flex-direction: row;     /* left column (toolbar + chart) | right column (AI Signal) */
+  flex-direction: row;
   height: 100vh;
 }
 
-/* Left column: toolbar stacked above the chart */
+/* Toolbar stacked above the chart, filling the full width */
 .main {
   flex: 1;
   display: flex;

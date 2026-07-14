@@ -1,15 +1,23 @@
-import { useRef } from 'react'
+import { useRef, useState } from 'react'
 import { Toolbar } from './components/Toolbar/Toolbar'
 import { Chart } from './components/Chart/Chart'
-import { AiDashboard } from './components/AiDashboard/AiDashboard'
 import { useUrlState } from './hooks/useUrlState'
-import { useAiWs } from './hooks/useAiWs'
 import type { Resolution } from './types/api'
 
 export function App() {
   const { symbol, resolution, setSymbol, setResolution } = useUrlState()
   const recalcRef = useRef<(() => void) | null>(null)
-  const aiState   = useAiWs(symbol, resolution)
+
+  const [showSrZones, setShowSrZones] = useState(
+    () => localStorage.getItem('showSrZones') !== '0'   // mặc định bật
+  )
+  const toggleSrZones = () => {
+    setShowSrZones(v => {
+      const next = !v
+      localStorage.setItem('showSrZones', next ? '1' : '0')
+      return next
+    })
+  }
 
   return (
     <div className="app">
@@ -20,15 +28,16 @@ export function App() {
           onSymbol={setSymbol}
           onResolution={setResolution}
           onRecalculate={() => recalcRef.current?.()}
+          showSrZones={showSrZones}
+          onToggleSrZones={toggleSrZones}
         />
         <Chart
           symbol={symbol}
           resolution={resolution as Resolution}
           recalcRef={recalcRef}
-          aiCards={aiState.cards}
+          showSrZones={showSrZones}
         />
       </div>
-      <AiDashboard symbol={symbol} aiState={aiState} />
     </div>
   )
 }

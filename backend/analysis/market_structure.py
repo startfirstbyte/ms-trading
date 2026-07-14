@@ -5,14 +5,13 @@ Swing H/L:  MT5 ZigZag algorithm (port of ZigZagColor.mq5, MetaQuotes).
 BOS/CHOCH:  custom real-time detection (compares cur_close to last swing levels).
 Channel:    linear-regression parallel channel.
 Wedge:      convergence detector.
-FVG:        Fair Value Gaps via smartmoneyconcepts (additive field).
 """
 from __future__ import annotations
 import logging
 import time as _time
 
 import pandas as _pd
-from smartmoneyconcepts import smc as _smc
+import pandas_ta as _ta
 
 log = logging.getLogger(__name__)
 
@@ -63,6 +62,17 @@ _TF_SCALP_HORIZON: dict[str, int] = {
     '1': 15, '3': 14, '5': 12, '15': 10, '60': 6,
 }
 _HORIZON_DEFAULT = 10
+
+# Window hồi quy kênh giá (bar) = (min, max); giá trị thực tế co giãn theo
+# volatility ratio (xem _volatility_ratio) — midpoint khớp giá trị cố định cũ.
+_TF_BAR_LOOKBACK: dict[str, tuple[int, int]] = {
+    '1':  (40, 80),
+    '3':  (40, 80),
+    '5':  (55, 105),
+    '15': (55, 105),
+    '60': (70, 130),
+}
+_BAR_LOOKBACK_DEFAULT = (55, 105)
 
 
 # ── DataFrame conversion ───────────────────────────────────────────────────────
@@ -233,11 +243,29 @@ def _clean_pivots(pivots: list[dict]) -> list[dict]:
 
 
 def _calc_atr(bars: list[dict], period: int = 14) -> float:
-    trs = []
-    for i in range(1, min(period + 1, len(bars))):
-        h, l, pc = bars[i]['high'], bars[i]['low'], bars[i - 1]['close']
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-    return sum(trs) / len(trs) if trs else 0.0
+    """ATR (Wilder smoothing) của `period` bar gần nhất, qua pandas-ta."""
+    if len(bars) < 2:
+        return 0.0
+    df  = _bars_to_df(bars)
+    atr = _ta.atr(df['high'], df['low'], df['close'], length=period)
+    val = atr.iloc[-1] if atr is not None else None
+    return float(val) if val is not None and not _pd.isna(val) else 0.0
+
+
+def _volatility_ratio(bars: list[dict]) -> float:
+    """
+    Biến động ngắn hạn / dài hạn (ATR14 gần nhất so với ATR40 nền). >1: vol đang
+    giãn (breakout/tăng tốc) → nên co window hồi quy kênh lại để bám kịp regime
+    mới; <1: đang co (sideway) → giãn window để có đủ dữ liệu tìm slope thật giữa
+    nhiễu. Thiếu dữ liệu lịch sử → 1.0 (trung tính, dùng midpoint mặc định).
+    """
+    if len(bars) < 60:
+        return 1.0
+    atr_short = _calc_atr(bars[-30:], period=14)
+    atr_long  = _calc_atr(bars[-90:] if len(bars) >= 90 else bars, period=40)
+    if atr_long <= 1e-9:
+        return 1.0
+    return atr_short / atr_long
 
 
 def _filter_noise(pivots: list[dict], min_move: float, min_bars: int = 3) -> list[dict]:
@@ -260,38 +288,6 @@ def _filter_noise(pivots: list[dict], min_move: float, min_bars: int = 3) -> lis
             elif p['type'] == 'low' and p['price'] < result[-1]['price']:
                 result[-1] = p
     return _clean_pivots(result)
-
-
-# ── FVG detection ──────────────────────────────────────────────────────────────
-
-def _detect_fvg(bars: list[dict]) -> list[dict]:
-    """Return up to 5 recent unmitigated Fair Value Gaps."""
-    if len(bars) < 3:
-        return []
-    try:
-        df = _bars_to_df(bars)
-        fvg_df = _smc.fvg(df, join_consecutive=False)
-        result: list[dict] = []
-        for i in range(len(fvg_df)):
-            fvg_val = fvg_df['FVG'].iloc[i]
-            if _pd.isna(fvg_val):
-                continue
-            mitigated = (
-                'MitigatedIndex' in fvg_df.columns
-                and not _pd.isna(fvg_df['MitigatedIndex'].iloc[i])
-            )
-            if mitigated:
-                continue
-            result.append({
-                'type':   'bullish' if int(fvg_val) == 1 else 'bearish',
-                'top':    round(float(fvg_df['Top'].iloc[i]), 5),
-                'bottom': round(float(fvg_df['Bottom'].iloc[i]), 5),
-                'time':   bars[i]['time'],
-            })
-        return result[-5:]
-    except Exception:
-        log.debug('FVG detection failed', exc_info=True)
-        return []
 
 
 
@@ -317,6 +313,52 @@ def _linreg(xs: list[float], ys: list[float]) -> tuple[float, float, float]:
     ss_res  = sum((y - (slope * x + intercept)) ** 2 for x, y in zip(xs, ys))
     r2      = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else 0.0
     return slope, intercept, max(0.0, min(1.0, r2))
+
+
+def _median(vals: list[float]) -> float:
+    s = sorted(vals)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+
+def _theil_sen_slope(xs: list[float], ys: list[float]) -> float:
+    """
+    Slope robust = trung vị của TẤT CẢ slope từng cặp điểm (Theil–Sen). Khác OLS
+    (bình phương residual → 1 điểm outlier bị khuếch đại bậc 2), ở đây outlier chỉ
+    đóng góp như bất kỳ cặp nào khác rồi bị trung vị hoá — 1 wick bất thường
+    không còn kéo lệch cả slope của rail.
+    """
+    n = len(xs)
+    if n < 2:
+        return 0.0
+    pair_slopes = [
+        (ys[j] - ys[i]) / (xs[j] - xs[i])
+        for i in range(n) for j in range(i + 1, n)
+        if abs(xs[j] - xs[i]) > 1e-9
+    ]
+    return _median(pair_slopes) if pair_slopes else 0.0
+
+
+def _fit_r2(xs: list[float], ys: list[float], slope: float) -> float:
+    """
+    R² của đường có slope cho trước (intercept = trung vị residual, kiểu
+    Theil–Sen) so với baseline trung bình — dùng để GATE: slope không có ý
+    nghĩa thống kê (r² thấp, giá thực chất là nhiễu ngang) thì không nên vẽ
+    kênh nghiêng lên nó.
+    """
+    n = len(xs)
+    if n < 2:
+        return 0.0
+    intercept = _median([y - slope * x for x, y in zip(xs, ys)])
+    mean_y  = sum(ys) / n
+    ss_tot  = sum((y - mean_y) ** 2 for y in ys)
+    if ss_tot < 1e-12:
+        return 0.0
+    ss_res  = sum((y - (slope * x + intercept)) ** 2 for x, y in zip(xs, ys))
+    return max(0.0, min(1.0, 1.0 - ss_res / ss_tot))
 
 
 # ── Swing classification ────────────────────────────────────────────────────────
@@ -425,20 +467,141 @@ def _range_box(all_h: list[dict], all_l: list[dict],
         'channel_type': 'range',
         'width':      round(width, 5),
         'width_pct':  round(width / mid * 100 if mid > 0 else 0.0, 4),
+        'r2':         0.0,
     }
 
 
-def _build_channel(classified: list[dict], bars: list[dict],
-                   cur_close: float, last_idx: int, resolution: str = '5') -> dict:
+def _channel_anchor(recent: list[dict], all_h: list[dict], all_l: list[dict],
+                    trend_local: str, last_idx: int) -> int:
+    """
+    Điểm gốc (anchor) của leg hiện tại — bullish → đáy thấp nhất trong window;
+    bearish → đỉnh cao nhất; ranging → pivot sớm nhất. Đây là gốc kênh, KHÔNG
+    phải 2 pivot cuối. Đảm bảo tối thiểu 5 bar để hồi quy có ý nghĩa; nếu cực trị
+    quá sát hiện tại thì lùi về pivot sớm nhất trong window.
+    """
+    if trend_local == 'bearish' and all_h:
+        anchor_idx = max(all_h, key=lambda p: p['price'])['idx']
+    elif trend_local == 'bullish' and all_l:
+        anchor_idx = min(all_l, key=lambda p: p['price'])['idx']
+    else:
+        anchor_idx = min(p['idx'] for p in recent)
+
+    anchor_idx = max(0, min(int(anchor_idx), last_idx))
+    if last_idx - anchor_idx < 5:
+        anchor_idx = max(0, min(int(min(p['idx'] for p in recent)), last_idx - 5))
+    return anchor_idx
+
+
+def _channel_slope(bars: list[dict], leg_h: list[dict], leg_l: list[dict],
+                   anchor_idx: int, last_idx: int) -> tuple[float, float]:
+    """
+    Slope song song = trung bình CÓ TRỌNG SỐ (theo số pivot) của hồi quy
+    Theil–Sen riêng dải ĐỈNH & dải ĐÁY → robust hơn OLS (không bị 1 wick bất
+    thường kéo lệch), rail nào nhiều pivot hơn được tin nhiều hơn thay vì
+    50/50 cứng. Thiếu pivot 1 phía → dùng phía kia; thiếu cả hai → fallback
+    hồi quy trên close. Trả thêm r² (đo trên slope đã chọn) để caller gate
+    kênh không có ý nghĩa thống kê.
+    """
+    parts: list[tuple[float, int, list[float], list[float]]] = []
+    if len(leg_h) >= 2:
+        hx = [float(p['idx']) for p in leg_h]
+        hy = [p['price'] for p in leg_h]
+        parts.append((_theil_sen_slope(hx, hy), len(leg_h), hx, hy))
+    if len(leg_l) >= 2:
+        lx = [float(p['idx']) for p in leg_l]
+        ly = [p['price'] for p in leg_l]
+        parts.append((_theil_sen_slope(lx, ly), len(leg_l), lx, ly))
+
+    if parts:
+        total_w = sum(w for _, w, _, _ in parts)
+        slope   = sum(s * w for s, w, _, _ in parts) / total_w
+        r2      = min(_fit_r2(xs, ys, slope) for _, _, xs, ys in parts)
+        return slope, r2
+
+    window = bars[anchor_idx:last_idx + 1]
+    wx = [float(anchor_idx + i) for i in range(len(window))]
+    wy = [float(b['close']) for b in window]
+    slope = _theil_sen_slope(wx, wy)
+    return slope, _fit_r2(wx, wy, slope)
+
+
+def _robust_edge(pivots: list[dict], slope: float, take_max: bool) -> float:
+    """
+    Offset của 1 rail = cực trị residual (giá - slope×idx) của các pivot phía đó
+    (đỉnh đẩy rail trên, đáy đẩy rail dưới). Bỏ 1 điểm cực đoan nhất nếu đủ pivot
+    (≥4) để một swing bất thường không một mình kéo méo cả rail; dưới 4 điểm thì
+    giữ đúng cực trị (không đủ dư để trim).
+    """
+    residuals = [p['price'] - slope * float(p['idx']) for p in pivots]
+    if len(residuals) >= 4:
+        residuals = sorted(residuals, reverse=take_max)[1:]
+    return max(residuals) if take_max else min(residuals)
+
+
+# slope/bar tính theo bội số ATR — resolution-invariant, thay % giá cố định cũ
+# (0.005% như nhau cho M1 lẫn H1 là sai vì biến động/bar mỗi khung thời gian khác nhau).
+_SLOPE_ATR_MULT = 0.15
+
+# r² tối thiểu để coi slope là có ý nghĩa thống kê. Dưới ngưỡng này giá thực
+# chất là nhiễu ngang → trả range box thay vì vẽ 1 đường nghiêng giả (fakeout
+# risk cao với scalping vì vào lệnh theo 1 "xu hướng" không tồn tại).
+_MIN_FIT_R2 = 0.15
+
+
+def _channel_direction(slope: float, atr_val: float) -> str:
+    if atr_val <= 0:
+        return 'flat'
+    ratio = slope / atr_val
+    if ratio > _SLOPE_ATR_MULT:  return 'up'
+    if ratio < -_SLOPE_ATR_MULT: return 'down'
+    return 'flat'
+
+
+def _channel_quality(leg_h: list[dict], leg_l: list[dict], slope: float,
+                     upper_off: float, lower_off: float, width: float) -> tuple[float, int]:
+    """
+    Quality (rail-respect, KHÔNG dùng r²(close)):
+      tightness — pivot bám sát rail của nó tới đâu, chuẩn hoá theo nửa width →
+                  CHẠY cả khi đi ngang (r² close ≈ 0 vẫn cho điểm cao nếu range gọn).
+      touch     — số pivot nằm trong tol của rail.
+      confirm   — kênh ÍT pivot (vd 3) thì rail trùng đúng cực trị → tightness/touch
+                  ẢO cao (mọi pivot nằm trên rail theo construction). Hạ điểm theo số
+                  pivot để 'minimal channel' không bị chấm gần hoàn hảo; cần ~6 pivot
+                  mới đạt hệ số tối đa.
+    """
+    half   = width / 2 if width else 1.0
+    up_res = [abs((p['price'] - slope * float(p['idx'])) - upper_off) for p in leg_h]
+    lo_res = [abs((p['price'] - slope * float(p['idx'])) - lower_off) for p in leg_l]
+    all_res   = up_res + lo_res
+    mean_res  = sum(all_res) / len(all_res) if all_res else half
+    tightness = max(0.0, 1.0 - mean_res / half)
+
+    tol = width * 0.12
+    edge_touch  = sum(1 for r in up_res if r < tol) + sum(1 for r in lo_res if r < tol)
+    touch_score = min(1.0, edge_touch / 4)
+
+    n_piv   = len(leg_h) + len(leg_l)
+    confirm = min(1.0, max(0.0, (n_piv - 2) / 4.0))
+    quality = round((0.5 * tightness + 0.5 * touch_score) * (0.5 + 0.5 * confirm), 4)
+    return quality, edge_touch
+
+
+def _build_channel(classified: list[dict], bars: list[dict], cur_close: float,
+                   last_idx: int, resolution: str, atr_val: float) -> dict:
     t_end = bars[last_idx]['time'] if bars else 0
     _empty = {'upper': cur_close, 'lower': cur_close, 'mid': cur_close,
               'slope_pct': 0.0, 'quality': 0.0, 'touch': 0, 'pos': 0.5, 'direction': 'flat',
               'upper_start': cur_close, 'lower_start': cur_close,
               'upper_end': cur_close, 'lower_end': cur_close,
               'time_start': t_end, 'time_end': t_end, 'channel_type': 'none',
-              'width': 0.0, 'width_pct': 0.0}
+              'width': 0.0, 'width_pct': 0.0, 'r2': 0.0}
 
-    bar_lookback = {'1': 60, '3': 60, '5': 80, '15': 80, '60': 100}.get(resolution, 80)
+    lo, hi = _TF_BAR_LOOKBACK.get(resolution, _BAR_LOOKBACK_DEFAULT)
+    vol_ratio = _volatility_ratio(bars[:last_idx + 1])
+    # vol_ratio trong [0.7, 1.7] map tuyến tính sang lookback [hi, lo] — giãn
+    # vol → window ngắn lại (bám regime mới nhanh hơn), co vol → window dài ra.
+    t = min(1.0, max(0.0, vol_ratio - 0.7))
+    bar_lookback = int(round(hi - (hi - lo) * t))
     recent = [p for p in classified[-16:] if last_idx - p['idx'] <= bar_lookback]
     if len(recent) < 3:
         recent = classified[-8:]
@@ -450,49 +613,25 @@ def _build_channel(classified: list[dict], bars: list[dict],
     if not all_h or not all_l:
         return _empty
 
-    trend_local = _detect_trend(classified)
-
-    # ── Anchor = điểm cực trị bắt đầu leg hiện tại ──────────────────────────────
-    #     bullish → đáy thấp nhất trong window; bearish → đỉnh cao nhất.
-    #     ranging → pivot sớm nhất. Đây là gốc của kênh, KHÔNG phải 2 pivot cuối.
-    if trend_local == 'bearish' and all_h:
-        anchor_idx = max(all_h, key=lambda p: p['price'])['idx']
-    elif trend_local == 'bullish' and all_l:
-        anchor_idx = min(all_l, key=lambda p: p['price'])['idx']
-    else:
-        anchor_idx = min(p['idx'] for p in recent)
-
-    anchor_idx = max(0, min(int(anchor_idx), last_idx))
-    # Cần đủ bar để hồi quy có ý nghĩa; nếu cực trị quá sát hiện tại → lùi về pivot sớm nhất
-    if last_idx - anchor_idx < 5:
-        anchor_idx = max(0, min(int(min(p['idx'] for p in recent)), last_idx - 5))
+    # Trend cục bộ TRONG window đang xét (không phải toàn bộ lịch sử classified) —
+    # anchor phải khớp phạm vi với rail đang fit, tránh lệch giữa 2 khái niệm trend.
+    trend_local = _detect_trend(recent)
+    anchor_idx  = _channel_anchor(recent, all_h, all_l, trend_local, last_idx)
     if last_idx - anchor_idx < 3:
         return _range_box(all_h, all_l, bars, cur_close, last_idx) or _empty
 
-    # ── A: kênh song song fit TỪ PIVOT (không phải close/wick) ───────────────────
-    # Pivot trong leg [anchor_idx, last_idx] — rail mô tả swing thật, đã lọc noise,
-    # nên 1 wick lẻ KHÔNG còn thổi phồng width như cách cũ (max(high-centre)).
+    # Kênh song song fit TỪ PIVOT trong leg [anchor_idx, last_idx] (không phải
+    # close/wick) — rail mô tả swing thật, đã lọc noise.
     leg_h = [p for p in all_h if p['idx'] >= anchor_idx] or all_h
     leg_l = [p for p in all_l if p['idx'] >= anchor_idx] or all_l
+    slope, fit_r2 = _channel_slope(bars, leg_h, leg_l, anchor_idx, last_idx)
+    if fit_r2 < _MIN_FIT_R2:
+        # Slope không có ý nghĩa thống kê (giá thực chất nhiễu ngang) → trả
+        # range box thay vì vẽ 1 kênh nghiêng giả, tránh fakeout khi scalping.
+        return _range_box(all_h, all_l, bars, cur_close, last_idx) or _empty
 
-    # Slope = trung bình slope hồi quy dải ĐỈNH & dải ĐÁY → buộc song song, bám
-    # cấu trúc swing (không phải drift của close). Thiếu pivot 1 phía → dùng phía kia;
-    # thiếu cả hai → fallback slope hồi quy close.
-    window = bars[anchor_idx:last_idx + 1]
-    c_slope, _, _ = _linreg([float(anchor_idx + i) for i in range(len(window))],
-                            [float(b['close']) for b in window])
-    slopes = []
-    if len(leg_h) >= 2:
-        hs, _, _ = _linreg([float(p['idx']) for p in leg_h], [p['price'] for p in leg_h])
-        slopes.append(hs)
-    if len(leg_l) >= 2:
-        ls, _, _ = _linreg([float(p['idx']) for p in leg_l], [p['price'] for p in leg_l])
-        slopes.append(ls)
-    slope = sum(slopes) / len(slopes) if slopes else c_slope
-
-    # Offset rail = cực trị residual của PIVOT (đỉnh đẩy rail trên, đáy đẩy rail dưới).
-    upper_off = max(p['price'] - slope * float(p['idx']) for p in leg_h)
-    lower_off = min(p['price'] - slope * float(p['idx']) for p in leg_l)
+    upper_off = _robust_edge(leg_h, slope, take_max=True)
+    lower_off = _robust_edge(leg_l, slope, take_max=False)
 
     xi_start = float(anchor_idx)
     xi_end   = float(last_idx)
@@ -509,31 +648,8 @@ def _build_channel(classified: list[dict], bars: list[dict],
     pos       = max(0.0, min(1.0, (cur_close - lower_end) / width))
     slope_pct = slope / mid * 100 if mid > 0 else 0.0
     width_pct = width / mid * 100 if mid > 0 else 0.0
-
-    if slope_pct > 0.005:    direction = 'up'
-    elif slope_pct < -0.005: direction = 'down'
-    else:                    direction = 'flat'
-
-    # ── Quality (rail-respect, KHÔNG dùng r²(close)) ────────────────────────────
-    # tightness: pivot bám sát rail của nó tới đâu, chuẩn hoá theo nửa width → CHẠY
-    #            cả khi đi ngang (r² close ≈ 0 vẫn cho điểm cao nếu range gọn).
-    # touch:     số pivot nằm trong tol của rail.
-    half   = width / 2 if width else 1.0
-    up_res = [abs((p['price'] - slope * float(p['idx'])) - upper_off) for p in leg_h]
-    lo_res = [abs((p['price'] - slope * float(p['idx'])) - lower_off) for p in leg_l]
-    all_res   = up_res + lo_res
-    mean_res  = sum(all_res) / len(all_res) if all_res else half
-    tightness = max(0.0, 1.0 - mean_res / half)
-
-    tol = width * 0.12
-    edge_touch  = sum(1 for r in up_res if r < tol) + sum(1 for r in lo_res if r < tol)
-    touch_score = min(1.0, edge_touch / 4)
-    # Confirmation: kênh ÍT pivot (vd 3) thì rail trùng đúng cực trị → tightness/touch
-    # ẢO cao (mọi pivot nằm trên rail theo construction). Hạ điểm theo số pivot để
-    # 'minimal channel' không bị chấm gần hoàn hảo; cần ~6 pivot mới đạt hệ số tối đa.
-    n_piv   = len(leg_h) + len(leg_l)
-    confirm = min(1.0, max(0.0, (n_piv - 2) / 4.0))
-    quality = round((0.5 * tightness + 0.5 * touch_score) * (0.5 + 0.5 * confirm), 4)
+    direction = _channel_direction(slope, atr_val)
+    quality, edge_touch = _channel_quality(leg_h, leg_l, slope, upper_off, lower_off, width)
 
     start_bar_idx = max(0, min(int(xi_start), len(bars) - 1))
     time_start = bars[start_bar_idx]['time']
@@ -557,7 +673,65 @@ def _build_channel(classified: list[dict], bars: list[dict],
         'channel_type': 'channel',
         'width':        round(width, 5),
         'width_pct':    round(width_pct, 4),
+        'r2':           round(fit_r2, 4),
     }
+
+
+# ── Support / Resistance zones ─────────────────────────────────────────────────
+
+def _sr_zones(bars: list[dict], classified: list[dict], channel: dict | None,
+             atr_val: float, max_each: int = 3, min_strength: int = 2) -> dict:
+    """Gom swing pivot + biên kênh thành VÙNG hỗ trợ/cản (band + độ mạnh), thay cho
+    các mức rời rạc. Pivot nằm trong ~0.5×ATR của nhau = cùng một vùng; chạm nhiều
+    lần = vùng mạnh. Trả {'supports': [...], 'resistances': [...]} so với giá hiện
+    tại, gần-nhất-trước. Mỗi zone: {lo, hi, mid, strength, recency}. Zone chỉ 1
+    điểm chạm (strength=1) bị lọc bỏ — 1 pivot đơn lẻ không đủ xác nhận là vùng
+    S/R thật, chỉ gây nhiễu (quá nhiều mức yếu trên chart)."""
+    if not bars or atr_val <= 0:
+        return {'supports': [], 'resistances': []}
+    price    = bars[-1]['close']
+    last_idx = len(bars) - 1
+    tol      = 0.5 * atr_val
+
+    # Điểm mức ứng viên: swing pivot gần đây (recency theo idx) + biên kênh (mức cấu trúc)
+    cands: list[dict] = []
+    for w in classified[-28:]:
+        cands.append({'price': w['price'], 'recency': max(0, last_idx - w['idx'])})
+    ch = channel or {}
+    for key in ('upper', 'lower'):
+        if ch.get(key):
+            cands.append({'price': ch[key], 'recency': 0})
+    if not cands:
+        return {'supports': [], 'resistances': []}
+
+    # Cluster theo khoảng cách giá
+    cands.sort(key=lambda c: c['price'])
+    clusters: list[list[dict]] = [[cands[0]]]
+    for c in cands[1:]:
+        if c['price'] - clusters[-1][-1]['price'] <= tol:
+            clusters[-1].append(c)
+        else:
+            clusters.append([c])
+
+    zones: list[dict] = []
+    for cl in clusters:
+        prices = [c['price'] for c in cl]
+        lo, hi = min(prices), max(prices)
+        if hi - lo < 0.30 * atr_val:      # cụm mỏng → cho vùng một độ rộng tối thiểu
+            mid = (lo + hi) / 2
+            lo, hi = mid - 0.15 * atr_val, mid + 0.15 * atr_val
+        zones.append({
+            'lo': round(lo, 5), 'hi': round(hi, 5), 'mid': round((lo + hi) / 2, 5),
+            'strength': len(cl), 'recency': min(c['recency'] for c in cl),
+        })
+
+    zones = [z for z in zones if z['strength'] >= min_strength]
+
+    supports    = sorted([z for z in zones if z['hi'] < price],
+                         key=lambda z: price - z['mid'])[:max_each]
+    resistances = sorted([z for z in zones if z['lo'] > price],
+                         key=lambda z: z['mid'] - price)[:max_each]
+    return {'supports': supports, 'resistances': resistances}
 
 
 # ── Wedge (nêm giá) detector ──────────────────────────────────────────────────
@@ -678,8 +852,8 @@ _NO_PATTERN: dict = {
     'pivots_count': 0,
     'recency':      None,
     'scalp':        False,
-    'fvg':          [],
     'rule_signal':  {'signal': 'WAIT', 'pos': 0.5, 'labels': []},
+    'sr_zones':     {'supports': [], 'resistances': []},
 }
 
 
@@ -723,10 +897,7 @@ def detect(bars: list[dict], resolution: str = '60') -> dict:
 
 
 def _detect_impl(bars: list[dict], resolution: str = '60') -> dict:
-    """
-    Detect the dominant Market Structure event (BOS / CHOCH) and Price Channel.
-    Output dict is backward-compatible; fvg is an additive field.
-    """
+    """Detect the dominant Market Structure event (BOS / CHOCH) and Price Channel."""
     if not bars:
         return {**_NO_PATTERN}
 
@@ -739,8 +910,7 @@ def _detect_impl(bars: list[dict], resolution: str = '60') -> dict:
 
     n = len(pivots)
     if n < 4:
-        return {**_NO_PATTERN, 'pivots_count': n,
-                'fvg': _detect_fvg(bars)}
+        return {**_NO_PATTERN, 'pivots_count': n}
 
     cur_close = bars[-1]['close']
     last_idx  = len(bars) - 1
@@ -748,10 +918,10 @@ def _detect_impl(bars: list[dict], resolution: str = '60') -> dict:
     classified = _classify_swings(pivots)
     trend      = _detect_trend(classified)
     event, bos_pivot, break_strength = _find_bos_choch(classified, cur_close, trend)
-    channel    = _build_channel(classified, bars, cur_close, last_idx, resolution)
+    channel    = _build_channel(classified, bars, cur_close, last_idx, resolution, atr_val)
     channel['atr'] = round(atr_val, 5)   # lộ ATR cho router xét buffer phá biên (mục D)
     wedge      = _detect_wedge(classified, bars)
-    fvg        = _detect_fvg(bars)
+    sr_zones   = _sr_zones(bars, classified, channel, atr_val)
 
     # ── Pattern + direction ────────────────────────────────────────────────────
     is_bos   = event.startswith('bos_')
@@ -777,8 +947,8 @@ def _detect_impl(bars: list[dict], resolution: str = '60') -> dict:
                     'channel': channel, 'waves': waves_out, 'wedge': wedge,
                     'structure': {'trend': trend, 'bos_level': None,
                                   'event': 'mid_channel', 'swings': classified[-6:]},
-                    'fvg': fvg,
-                    'rule_signal': _rule_signal(classified, channel)}
+                    'rule_signal': _rule_signal(classified, channel),
+                    'sr_zones': sr_zones}
 
     pattern_name = f"{direction}_{event}" if not event.startswith(direction[:4]) else event
 
@@ -817,8 +987,8 @@ def _detect_impl(bars: list[dict], resolution: str = '60') -> dict:
                 'channel': channel, 'wedge': wedge,
                 'structure': {'trend': trend, 'bos_level': None,
                               'event': 'mid_channel', 'swings': classified[-6:]},
-                'fvg': fvg,
-                'rule_signal': _rule_signal(classified, channel)}
+                'rule_signal': _rule_signal(classified, channel),
+                'sr_zones': sr_zones}
 
     # ── Targets ────────────────────────────────────────────────────────────────
     highs = sorted([p for p in classified if p['type'] == 'high'], key=lambda x: x['price'])
@@ -880,5 +1050,5 @@ def _detect_impl(bars: list[dict], resolution: str = '60') -> dict:
         'scalp':        recency_bars <= horizon,
         'computed_at':  int(_time.time() * 1000),
         'rule_signal':  rule_sig,
-        'fvg':          fvg,
+        'sr_zones':     sr_zones,
     }

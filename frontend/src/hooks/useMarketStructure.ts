@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { RefObject } from 'react'
 import type { IChartingLibraryWidget, EntityId } from 'charting_library'
-import type { MSResult, MSWave, MSChannel, MSWedge, MSRuleSignal, PriceChannel } from '../types/api'
+import type { MSResult, MSWave, MSChannel, MSWedge, MSRuleSignal, PriceChannel, MSSrZones } from '../types/api'
 import { MS_LOOKBACK } from '../types/domain'
 
 // ── Notification helper ───────────────────────────────────────────────────────
@@ -31,9 +31,23 @@ interface MSSnapshot {
   channel:     MSChannel | null
   wedge:       MSWedge | null | undefined
   structure:   { trend: string; bos_level: number | null; event: string } | null
+  sr_zones?:   MSSrZones
+}
+
+// resolution → ms/bar, dùng để chiếu vùng S/R về phía tương lai trên chart
+const _RES_MS: Record<string, number> = {
+  '1': 60_000, '3': 180_000, '5': 300_000, '15': 900_000, '60': 3_600_000,
 }
 
 // ── Shape helper ──────────────────────────────────────────────────────────────
+
+function hexToRgba(hex: string, alpha: number): string {
+  const h = hex.replace('#', '')
+  const r = parseInt(h.substring(0, 2), 16)
+  const g = parseInt(h.substring(2, 4), 16)
+  const b = parseInt(h.substring(4, 6), 16)
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`
+}
 
 type ShapePoint = { time: number; price: number }
 
@@ -94,7 +108,10 @@ function drawSnapshot(
 ): Promise<EntityId | null>[] {
   const ids: Promise<EntityId | null>[] = []
   const { waves = [], draw_waves, channel: ch, structure } = snap
-  if (!ch && waves.length < 2) return ids
+  // Vẽ nếu có channel HOẶC đủ pivot để vẽ zigzag (draw_waves ưu tiên, fallback waves).
+  // Trước đây chỉ xét waves → TF pattern=none/channel=null (vd 1m) bị bỏ vẽ dù có draw_waves.
+  const hasZz = (draw_waves?.length ?? 0) >= 2 || waves.length >= 2
+  if (!ch && !hasZz) return ids
 
   const toSec = (ms: number) => Math.floor(ms / 1000)
 
@@ -160,21 +177,27 @@ function drawChannels(
     const ch = pc.channel
     if (!ch || !ch.time_start || !ch.time_end) continue
 
+    // 3 trạng thái: confirmed (đậm nhất) > editing (vừa) > committed (mờ nét đứt).
     const editing      = pc.status === 'editing'
+    const confirmed    = pc.status === 'confirmed'
+    const committed    = pc.status === 'committed'
     const chColor      = ch.direction === 'up' ? '#26a69a' : ch.direction === 'down' ? '#ef5350' : '#787b86'
-    const lw           = editing ? 2 : 1
-    const lstyle       = editing ? 0 : 2     // editing nét liền, committed nét đứt
-    // committed = lịch sử (kênh đã phá): làm MỜ HẲN để lùi về nền, không lấn editing.
-    // Kênh tăng bị phá xuống nằm "trên trời" so với giá hiện tại → phải nhạt để không gây nhiễu.
-    const transparency = editing ? 80 : 97   // committed gần như trong suốt
-    const fillBg       = editing             // committed bỏ fill, chỉ còn viền mảnh nét đứt
+    // committed dùng màu pha loãng alpha — nét mảnh/nét đứt trước đây vẫn giữ màu
+    // gốc 100% nên nhìn không thực sự mờ; giờ viền cũng nhạt đi để rõ là "channel cũ".
+    const lineColor    = committed ? hexToRgba(chColor, 0.35) : chColor
+    const lw           = committed ? 1 : 2          // committed mảnh, editing/confirmed đậm
+    const lstyle       = committed ? 2 : 0          // committed nét đứt, còn lại nét liền
+    // fill: confirmed đậm nhất (macro xác nhận) → editing vừa → committed gần như trong suốt.
+    const transparency = confirmed ? 72 : editing ? 82 : 97
+    const fillBg       = !committed                 // committed bỏ fill, chỉ viền mảnh nét đứt
+    const showMid      = !committed
 
     if (ch.channel_type === 'range') {
       ids.push(addShape(chart, [
         { time: toSec(ch.time_start), price: ch.upper },
         { time: toSec(ch.time_end),   price: ch.lower },
       ], 'rectangle', {
-        color:           chColor,
+        color:           lineColor,
         linewidth:       lw,
         linestyle:       lstyle,
         fillBackground:  fillBg,
@@ -187,10 +210,10 @@ function drawChannels(
         { time: toSec(ch.time_end),   price: ch.lower_end   ?? ch.lower },
         { time: toSec(ch.time_end),   price: ch.upper_end   ?? ch.upper },
       ], 'parallel_channel', {
-        linecolor:       chColor,
+        linecolor:       lineColor,
         linewidth:       lw,
         linestyle:       lstyle,
-        showMidline:     editing,
+        showMidline:     showMid,
         midlinecolor:    chColor,
         midlinestyle:    1,
         midlinewidth:    1,
@@ -202,8 +225,8 @@ function drawChannels(
       }))
     }
 
-    // Nhãn đo lường — chỉ cho channel đang editing
-    if (editing) {
+    // Nhãn đo lường — editing & confirmed (confirmed có dấu ✓ phân biệt xu hướng đã xác nhận)
+    if (editing || confirmed) {
       const width   = ch.width ?? (ch.upper - ch.lower)
       const pctText = ch.width_pct != null
         ? ch.width_pct.toFixed(2)
@@ -211,10 +234,11 @@ function drawChannels(
       const ampText = width >= 50 ? width.toFixed(1) : width.toFixed(2)
       const posPct  = Math.round((ch.pos ?? 0.5) * 100)
       const edge    = ch.upper_end ?? ch.upper
+      const prefix  = confirmed ? '✓ ' : ''
       ids.push(addShape(chart,
         { time: toSec(ch.time_end), price: edge },
         'text', {
-          text:      `Biên độ ${ampText} (${pctText}%)  ·  Vị trí ${posPct}%`,
+          text:      `${prefix}Biên độ ${ampText} (${pctText}%)  ·  Vị trí ${posPct}%`,
           color:     chColor,
           fontsize:  11,
           bold:      true,
@@ -223,7 +247,7 @@ function drawChannels(
     }
 
     // Committed — đánh dấu điểm phá biên (text trung tính, không dùng mũi tên)
-    if (!editing && pc.break_price != null && pc.break_time != null) {
+    if (committed && pc.break_price != null && pc.break_time != null) {
       ids.push(addShape(chart,
         { time: toSec(pc.break_time), price: pc.break_price },
         'text', {
@@ -237,6 +261,56 @@ function drawChannels(
   return ids
 }
 
+// ── Support / Resistance zones ────────────────────────────────────────────────
+// Vùng (không phải mức rời rạc) — vẽ rectangle mờ từ timeStart tới timeEnd (chiếu
+// một đoạn về tương lai để trông như vùng còn "sống", giống cách committed channel
+// chiếu mép phải). Càng nhiều pivot gom vào 1 vùng (strength cao) → fill đậm hơn.
+
+function drawSrZones(
+  chart:      ReturnType<IChartingLibraryWidget['chart']>,
+  zones:      MSSrZones | undefined,
+  timeStart:  number,
+  timeEnd:    number,
+  labelTime:  number,   // mép hiện tại (bar cuối) — nhãn LUÔN nằm trong vùng nhìn thấy
+                        // mặc định, khác timeEnd (chiếu tương lai, có thể ngoài viewport).
+): Promise<EntityId | null>[] {
+  const ids: Promise<EntityId | null>[] = []
+  if (!zones) return ids
+  const toSec = (ms: number) => Math.floor(ms / 1000)
+  const s = toSec(timeStart)
+  const e = toSec(timeEnd)
+  const l = toSec(labelTime)
+
+  const drawSide = (list: MSSrZones['supports'], color: string, label: string) => {
+    for (const z of list) {
+      const transparency = z.strength >= 3 ? 78 : z.strength >= 2 ? 84 : 90
+      ids.push(addShape(chart, [
+        { time: s, price: z.hi },
+        { time: e, price: z.lo },
+      ], 'rectangle', {
+        color,
+        linewidth:       1,
+        linestyle:       2,
+        fillBackground:  true,
+        backgroundColor: color,
+        transparency,
+      }))
+      ids.push(addShape(chart,
+        { time: l, price: z.mid },
+        'text', {
+          text:      `${label} ×${z.strength}`,
+          color,
+          fontsize:  10,
+          fixedSize: true,
+        }))
+    }
+  }
+
+  drawSide(zones.supports ?? [],    '#26a69a', 'S')
+  drawSide(zones.resistances ?? [], '#ef5350', 'R')
+  return ids
+}
+
 // ── Hook ──────────────────────────────────────────────────────────────────────
 
 export function useMarketStructure(
@@ -244,6 +318,7 @@ export function useMarketStructure(
   chartReadyRef: RefObject<boolean>,
   symbol:       string,
   resolution:   string,
+  showSrZones:  boolean = true,
 ) {
   const [chip,   setChip]   = useState<MSChip>({ text: 'MS', cls: '' })
   const [signal, setSignal] = useState<MSRuleSignal>({ signal: 'WAIT', pos: 0.5, labels: [] })
@@ -253,6 +328,7 @@ export function useMarketStructure(
 
   const shapeIdsRef = useRef<Promise<EntityId | null>[]>([])
   const drawnSigRef = useRef<string | null>(null)
+  const lastDataRef = useRef<{ snapshots: MSSnapshot[]; channels: PriceChannel[] } | null>(null)
   const abortRef    = useRef<AbortController | null>(null)
   const timerRef    = useRef<ReturnType<typeof setInterval> | null>(null)
 
@@ -286,6 +362,20 @@ export function useMarketStructure(
     const n    = snapshots.length
     const ids: Promise<EntityId | null>[] = []
 
+    // Channels vẽ TRƯỚC (nền có fill) → zigzag/label vẽ SAU sẽ nằm TRÊN, không bị fill
+    // của confirmed/editing che. (z-order TradingView: shape vẽ sau nằm trên.)
+    ids.push(...drawChannels(chart, channels))
+
+    // S/R zones — chỉ vẽ cho snapshot mới nhất (không phải lịch sử), chiếu ~40 bar
+    // về tương lai để vùng trông "còn sống" cho tới khi bị phá.
+    if (showSrZones && n && snapshots[0].sr_zones) {
+      const latest0  = snapshots[0]
+      const resMs    = _RES_MS[resolution] ?? 60_000
+      const timeEnd  = latest0.computed_at + 40 * resMs
+      const timeStart = latest0.channel?.time_start ?? (latest0.computed_at - (MS_LOOKBACK[resolution] ?? 150) * resMs)
+      ids.push(...drawSrZones(chart, latest0.sr_zones, timeStart, timeEnd, latest0.computed_at))
+    }
+
     for (let i = 0; i < n; i++) {
       const snap     = snapshots[i]
       const isLatest = i === 0
@@ -314,12 +404,9 @@ export function useMarketStructure(
       ], 'trend_line', { linecolor: segColor, linewidth: 1, linestyle: 0 }))
     }
 
-    // Channels (editing + committed) từ store có lifecycle
-    ids.push(...drawChannels(chart, channels))
-
     shapeIdsRef.current = ids
     if (snapshots.length) setChip(buildChip(snapshots[0]))
-  }, [chartReadyRef, widgetRef])
+  }, [chartReadyRef, widgetRef, resolution, showSrZones])
 
   // ── Fetch snapshots from DB + compute latest ───────────────────────────────
 
@@ -368,6 +455,7 @@ export function useMarketStructure(
         channel:     latest.channel ?? null,
         wedge:       latest.wedge ?? null,
         structure:   latest.structure ?? null,
+        sr_zones:    latest.sr_zones,
       }
 
       const seen = new Set<number>([latestSnap.computed_at])
@@ -380,9 +468,15 @@ export function useMarketStructure(
         if (snapshots.length >= 4) break   // current + 3 historical
       }
 
-      // Signature — gồm cả lifecycle channel để commit/leg mới trigger redraw
+      // Cache cho toggle showSrZones — bật/tắt vẽ lại tức thì bằng data đã fetch,
+      // không cần gọi lại /api/ms/compute.
+      lastDataRef.current = { snapshots, channels }
+
+      // Signature — gồm cả lifecycle channel + sr_zones để commit/leg/vùng mới trigger redraw
       const chSig = channels.map(c => `${c.id}:${c.status}:${c.channel?.upper_end ?? 0}`).join(',')
-      const sig = `${latestSnap.pattern}|${latestSnap.confidence}|${latestSnap.waves.length}|${latestSnap.draw_waves?.length ?? 0}|${chSig}`
+      const zSig = [...(latestSnap.sr_zones?.supports ?? []), ...(latestSnap.sr_zones?.resistances ?? [])]
+        .map(z => `${z.mid}:${z.strength}`).join(',')
+      const sig = `${latestSnap.pattern}|${latestSnap.confidence}|${latestSnap.waves.length}|${latestSnap.draw_waves?.length ?? 0}|${chSig}|${zSig}`
       if (sig === drawnSigRef.current) {
         setChip(buildChip(latestSnap))
         return
@@ -426,6 +520,21 @@ export function useMarketStructure(
       clearShapes()
     }
   }, [fetchAndDraw, clearShapes])
+
+  // ── Toggle showSrZones: vẽ lại NGAY bằng data đã cache, không gọi lại API ────
+  // Refs để effect chỉ phụ thuộc showSrZones (không phải mỗi khi drawAll đổi
+  // identity do resolution đổi — tránh vẽ "nháy" bằng data cũ trước khi fetch mới xong).
+
+  const drawAllRef      = useRef(drawAll)
+  const clearShapesRef  = useRef(clearShapes)
+  drawAllRef.current     = drawAll
+  clearShapesRef.current = clearShapes
+
+  useEffect(() => {
+    if (!lastDataRef.current) return   // chưa fetch lần nào (mount đầu) → bỏ qua
+    clearShapesRef.current()
+    drawAllRef.current(lastDataRef.current.snapshots, lastDataRef.current.channels)
+  }, [showSrZones])
 
   // ── Public API ─────────────────────────────────────────────────────────────
 

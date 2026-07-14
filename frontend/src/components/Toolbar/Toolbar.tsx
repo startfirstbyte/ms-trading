@@ -9,9 +9,14 @@ interface Props {
   onSymbol: (s: string) => void
   onResolution: (r: Resolution) => void
   onRecalculate: () => void
+  showSrZones: boolean
+  onToggleSrZones: () => void
 }
 
-export function Toolbar({ symbol, resolution, onSymbol, onResolution, onRecalculate }: Props) {
+export function Toolbar({
+  symbol, resolution, onSymbol, onResolution, onRecalculate,
+  showSrZones, onToggleSrZones,
+}: Props) {
   return (
     <header className={styles.toolbar}>
       <select
@@ -46,6 +51,14 @@ export function Toolbar({ symbol, resolution, onSymbol, onResolution, onRecalcul
         title="Recalculate market structure"
       >
         ↺ MS
+      </button>
+
+      <button
+        className={[styles.btn, showSrZones ? styles.active : ''].join(' ')}
+        onClick={onToggleSrZones}
+        title="Hiện/ẩn vùng hỗ trợ/cản (S/R zones)"
+      >
+        S/R
       </button>
 
       <div className={styles.separator} />
