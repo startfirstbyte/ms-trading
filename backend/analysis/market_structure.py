@@ -677,6 +677,63 @@ def _build_channel(classified: list[dict], bars: list[dict], cur_close: float,
     }
 
 
+# ── Support / Resistance zones ─────────────────────────────────────────────────
+
+def _sr_zones(bars: list[dict], classified: list[dict], channel: dict | None,
+             atr_val: float, max_each: int = 3, min_strength: int = 2) -> dict:
+    """Gom swing pivot + biên kênh thành VÙNG hỗ trợ/cản (band + độ mạnh), thay cho
+    các mức rời rạc. Pivot nằm trong ~0.5×ATR của nhau = cùng một vùng; chạm nhiều
+    lần = vùng mạnh. Trả {'supports': [...], 'resistances': [...]} so với giá hiện
+    tại, gần-nhất-trước. Mỗi zone: {lo, hi, mid, strength, recency}. Zone chỉ 1
+    điểm chạm (strength=1) bị lọc bỏ — 1 pivot đơn lẻ không đủ xác nhận là vùng
+    S/R thật, chỉ gây nhiễu (quá nhiều mức yếu trên chart)."""
+    if not bars or atr_val <= 0:
+        return {'supports': [], 'resistances': []}
+    price    = bars[-1]['close']
+    last_idx = len(bars) - 1
+    tol      = 0.5 * atr_val
+
+    # Điểm mức ứng viên: swing pivot gần đây (recency theo idx) + biên kênh (mức cấu trúc)
+    cands: list[dict] = []
+    for w in classified[-28:]:
+        cands.append({'price': w['price'], 'recency': max(0, last_idx - w['idx'])})
+    ch = channel or {}
+    for key in ('upper', 'lower'):
+        if ch.get(key):
+            cands.append({'price': ch[key], 'recency': 0})
+    if not cands:
+        return {'supports': [], 'resistances': []}
+
+    # Cluster theo khoảng cách giá
+    cands.sort(key=lambda c: c['price'])
+    clusters: list[list[dict]] = [[cands[0]]]
+    for c in cands[1:]:
+        if c['price'] - clusters[-1][-1]['price'] <= tol:
+            clusters[-1].append(c)
+        else:
+            clusters.append([c])
+
+    zones: list[dict] = []
+    for cl in clusters:
+        prices = [c['price'] for c in cl]
+        lo, hi = min(prices), max(prices)
+        if hi - lo < 0.30 * atr_val:      # cụm mỏng → cho vùng một độ rộng tối thiểu
+            mid = (lo + hi) / 2
+            lo, hi = mid - 0.15 * atr_val, mid + 0.15 * atr_val
+        zones.append({
+            'lo': round(lo, 5), 'hi': round(hi, 5), 'mid': round((lo + hi) / 2, 5),
+            'strength': len(cl), 'recency': min(c['recency'] for c in cl),
+        })
+
+    zones = [z for z in zones if z['strength'] >= min_strength]
+
+    supports    = sorted([z for z in zones if z['hi'] < price],
+                         key=lambda z: price - z['mid'])[:max_each]
+    resistances = sorted([z for z in zones if z['lo'] > price],
+                         key=lambda z: z['mid'] - price)[:max_each]
+    return {'supports': supports, 'resistances': resistances}
+
+
 # ── Wedge (nêm giá) detector ──────────────────────────────────────────────────
 
 def _detect_wedge(classified: list[dict], bars: list[dict]) -> dict | None:
@@ -796,6 +853,7 @@ _NO_PATTERN: dict = {
     'recency':      None,
     'scalp':        False,
     'rule_signal':  {'signal': 'WAIT', 'pos': 0.5, 'labels': []},
+    'sr_zones':     {'supports': [], 'resistances': []},
 }
 
 
@@ -863,6 +921,7 @@ def _detect_impl(bars: list[dict], resolution: str = '60') -> dict:
     channel    = _build_channel(classified, bars, cur_close, last_idx, resolution, atr_val)
     channel['atr'] = round(atr_val, 5)   # lộ ATR cho router xét buffer phá biên (mục D)
     wedge      = _detect_wedge(classified, bars)
+    sr_zones   = _sr_zones(bars, classified, channel, atr_val)
 
     # ── Pattern + direction ────────────────────────────────────────────────────
     is_bos   = event.startswith('bos_')
@@ -888,7 +947,8 @@ def _detect_impl(bars: list[dict], resolution: str = '60') -> dict:
                     'channel': channel, 'waves': waves_out, 'wedge': wedge,
                     'structure': {'trend': trend, 'bos_level': None,
                                   'event': 'mid_channel', 'swings': classified[-6:]},
-                    'rule_signal': _rule_signal(classified, channel)}
+                    'rule_signal': _rule_signal(classified, channel),
+                    'sr_zones': sr_zones}
 
     pattern_name = f"{direction}_{event}" if not event.startswith(direction[:4]) else event
 
@@ -927,7 +987,8 @@ def _detect_impl(bars: list[dict], resolution: str = '60') -> dict:
                 'channel': channel, 'wedge': wedge,
                 'structure': {'trend': trend, 'bos_level': None,
                               'event': 'mid_channel', 'swings': classified[-6:]},
-                'rule_signal': _rule_signal(classified, channel)}
+                'rule_signal': _rule_signal(classified, channel),
+                'sr_zones': sr_zones}
 
     # ── Targets ────────────────────────────────────────────────────────────────
     highs = sorted([p for p in classified if p['type'] == 'high'], key=lambda x: x['price'])
@@ -989,4 +1050,5 @@ def _detect_impl(bars: list[dict], resolution: str = '60') -> dict:
         'scalp':        recency_bars <= horizon,
         'computed_at':  int(_time.time() * 1000),
         'rule_signal':  rule_sig,
+        'sr_zones':     sr_zones,
     }

@@ -18,6 +18,29 @@ MT5 → worker.py (Windows host) → HTTP webhook → FastAPI backend (container
 
 ---
 
+## STEP 0 — New request workflow (run this before STEP 1)
+
+Every new request goes through the same lifecycle. Which steps actually do something scales with
+size — a one-line fix skips straight to "implement", a cross-layer feature uses all of them.
+
+1. **Route** — use the STEP 1 table below → load the matching sub-skill(s) for file map/patterns/gotchas.
+2. **Align (if non-trivial or cross-layer)** — `EnterPlanMode`, propose the approach, get it confirmed
+   before touching code. Skip for small, obvious, single-file changes.
+3. **Track (if multi-step)** — `TaskCreate`/`TaskUpdate` for the steps while implementing. Ephemeral,
+   scoped to the current conversation — not a place to persist anything for later.
+4. **Persist — decide what survives past this conversation, and where:**
+   | What it is | Where it goes |
+   |---|---|
+   | Non-obvious decision/tradeoff, cross-layer impact, hard-to-reverse choice — future-you will ask "why did we do it this way" | New Obsidian note: ADR in `Trading Project/01-Architecture/decisions/` (or `06-Incidents/` for a postmortem). Update `00-Index.md` MOC + `07-Roadmap/backlog.md` if follow-up work remains. |
+   | Changes the "how" — a pattern, file map, gotcha, procedure | Edit the relevant `.claude/skills/*/SKILL.md` (repo, git-tracked) |
+   | Short fact useful in future sessions (who/why/deadline, a preference confirmed or corrected) | Save to memory |
+   | Trivial, local, self-explanatory from the code itself | Don't document anywhere — it would just be noise that rots |
+
+   **Default to NOT writing an Obsidian note.** Most requests don't clear the bar in row 1 — only
+   write one when a future session would otherwise have to re-derive the "why" from scratch.
+
+---
+
 ## STEP 1 — Route the task (read this first)
 
 | Task involves... | Layer | Sub-skill to load | Deploy after change |
@@ -230,6 +253,27 @@ Cleanup function in `useEffect` is mandatory. Call `datafeed.closeAll()` and `wi
 | `run` (global) | Launch app, screenshot, test golden path |
 | `verify` (global) | Confirm a change works end-to-end |
 | `code-review` (global) | Review diff before committing |
+
+---
+
+## Reference: Long-form docs (Obsidian)
+
+Deep "why" docs — architecture decisions, incident postmortems, cost-tuning history — live in the
+Obsidian vault, not in this skill (kept lean) or in memory (kept short). Entry point: note
+`Trading Project/00-Index.md` in the vault. Every note has frontmatter `layer` (architecture/
+backend/frontend/analysis/infra/incidents/roadmap) + `related-skill` — query by tag/frontmatter
+via `mcp__obsidian__search_query` rather than guessing paths (they can move).
+
+```json
+{"==": [{"var": "frontmatter.related-skill"}, "technical-analysis"]}
+```
+
+Current notes: system-overview, ADR-001 (Claude CLI bridge), ADR-002 (weekend history fallback),
+ADR-003 (server.py refactor), api-endpoints, redis-pg-schema, ai-signal-lock, ai-cost-tuning,
+ai-auto-killswitch, worker-data-flow, 2026-06-22-h1-timeout (incident), backlog.
+
+> If `mcp__obsidian__*` tools aren't showing up, the MCP server only populates at session start —
+> see memory `ref_obsidian_mcp`.
 
 ---
 

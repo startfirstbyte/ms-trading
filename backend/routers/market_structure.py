@@ -287,6 +287,7 @@ _EMPTY_MS = {
     "pattern": "none", "confidence": 0.0, "prediction": "neutral",
     "complete": False, "direction": None, "next_target": None,
     "targets": [], "fib": None, "waves": [], "pivots_count": 0,
+    "sr_zones": {"supports": [], "resistances": []},
 }
 
 # Mỗi timeframe tự tính MS/channel độc lập (1m không còn kế thừa 3m).
